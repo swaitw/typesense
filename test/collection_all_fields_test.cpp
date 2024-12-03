@@ -3,8 +3,11 @@
 #include <vector>
 #include <fstream>
 #include <algorithm>
+#include <filesystem>
 #include <collection_manager.h>
 #include "collection.h"
+#include "embedder_manager.h"
+#include "http_client.h"
 
 class CollectionAllFieldsTest : public ::testing::Test {
 protected:
@@ -19,6 +22,7 @@ protected:
         std::string state_dir_path = "/tmp/typesense_test/collection_all_fields";
         LOG(INFO) << "Truncating and creating: " << state_dir_path;
         system(("rm -rf "+state_dir_path+" && mkdir -p "+state_dir_path).c_str());
+        system("mkdir -p /tmp/typesense_test/models");
 
         store = new Store(state_dir_path);
         collectionManager.init(store, 1.0, "auth_key", quit);
@@ -309,7 +313,7 @@ TEST_F(CollectionAllFieldsTest, ShouldBeAbleToUpdateSchemaDetectedDocs) {
     // insert multiple docs at the same time
     const size_t NUM_DOCS = 20;
     std::vector<std::string> json_lines;
-    
+
     for(size_t i = 0; i < NUM_DOCS; i++) {
         const std::string &i_str = std::to_string(i);
         doc["title"] = std::string("upserted ") + std::to_string(StringUtils::hash_wy(i_str.c_str(), i_str.size()));
@@ -1248,6 +1252,11 @@ TEST_F(CollectionAllFieldsTest, DoNotIndexFieldMarkedAsNonIndex) {
     ASSERT_FALSE(res_op.ok());
     ASSERT_EQ("Field `post` is marked as a non-indexed field in the schema.", res_op.error());
 
+    // wildcard pattern should exclude non-indexed field while searching,
+    res_op = coll1->search("Amazon", {"*"}, "", {}, sort_fields, {0}, 10, 1, FREQUENCY, {false});
+    ASSERT_TRUE(res_op.ok());
+    ASSERT_EQ(1, res_op.get()["hits"].size());
+
     // try updating a document with non-indexable field
     doc["post"] = "Some post updated.";
     auto update_op = coll1->add(doc.dump(), UPDATE, "0");
@@ -1275,7 +1284,7 @@ TEST_F(CollectionAllFieldsTest, DoNotIndexFieldMarkedAsNonIndex) {
 
     auto op = collectionManager.create_collection("coll2", 1, fields, "", 0, field_types::AUTO);
     ASSERT_FALSE(op.ok());
-    ASSERT_EQ("Field `post` must be optional since it is marked as non-indexable.", op.error());
+    ASSERT_EQ("Field `.*_txt` cannot be a facet since it's marked as non-indexable.", op.error());
 
     fields = {field("company_name", field_types::STRING, false),
               field("num_employees", field_types::INT32, false),
@@ -1553,6 +1562,42 @@ TEST_F(CollectionAllFieldsTest, FieldNameMatchingRegexpShouldNotBeIndexed) {
     ASSERT_EQ(1, results["hits"].size());
 }
 
+TEST_F(CollectionAllFieldsTest, AutoFieldValueCoercionRemoval) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+            {"name": "store", "type": "auto", "optional": true}
+        ]
+    })"_json;
+
+
+    auto coll1 = collectionManager.create_collection(schema).get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["store"]["id"] = 123;
+
+    coll1->add(doc1.dump(), CREATE);
+
+    // string value will be coerced to integer
+    doc1["id"] = "1";
+    doc1["store"]["id"] = "124";
+    coll1->add(doc1.dump(), CREATE);
+
+    // removal should work correctly
+    coll1->remove("1");
+
+    auto results = coll1->search("*", {},
+                                 "store.id: 124", {}, {}, {2}, 10,
+                                 1, FREQUENCY, {true},
+                                 1, spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "title", 5, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {}, 1000, true).get();
+
+    ASSERT_EQ(0, results["found"].get<size_t>());
+}
+
 TEST_F(CollectionAllFieldsTest, FieldNameMatchingRegexpShouldNotBeIndexedInNonAutoSchema) {
     std::vector<field> fields = {field("title", field_types::STRING, false),
                                  field("name.*", field_types::STRING, true, true)};
@@ -1584,5 +1629,175 @@ TEST_F(CollectionAllFieldsTest, FieldNameMatchingRegexpShouldNotBeIndexedInNonAu
                                  "<mark>", "</mark>", {}, 1000, true).get();
 
     ASSERT_EQ(1, results["hits"].size());
+}
+
+TEST_F(CollectionAllFieldsTest, EmbedFromFieldJSONInvalidField) {
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    nlohmann::json field_json;
+    field_json["name"] = "embedding";
+    field_json["type"] = "float[]";
+    field_json["embed"] = nlohmann::json::object();
+    field_json["embed"]["from"] = {"name"};
+    field_json["embed"]["model_config"] = nlohmann::json::object();
+    field_json["embed"]["model_config"]["model_name"] = "ts/e5-small";
+
+    std::vector<field> fields;
+    std::string fallback_field_type;
+    auto arr = nlohmann::json::array();
+    arr.push_back(field_json);
+
+    auto field_op = field::json_fields_to_fields(false, arr, fallback_field_type, fields);
+
+    ASSERT_FALSE(field_op.ok());
+    ASSERT_EQ("Property `embed.from` can only refer to string, string array or image (for supported models) fields.", field_op.error());
+}
+
+TEST_F(CollectionAllFieldsTest, EmbedFromNotArray) {
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    nlohmann::json field_json;
+    field_json["name"] = "embedding";
+    field_json["type"] = "float[]";
+    field_json["embed"] = nlohmann::json::object();
+    field_json["embed"]["from"] = "name";
+    field_json["embed"]["model_config"] = nlohmann::json::object();
+    field_json["embed"]["model_config"]["model_name"] = "ts/e5-small";
+
+    std::vector<field> fields;
+    std::string fallback_field_type;
+    auto arr = nlohmann::json::array();
+    arr.push_back(field_json);
+
+    auto field_op = field::json_fields_to_fields(false, arr, fallback_field_type, fields);
+
+    ASSERT_FALSE(field_op.ok());
+    ASSERT_EQ("Property `embed.from` must be an array.", field_op.error());
+}
+
+TEST_F(CollectionAllFieldsTest, ModelParametersWithoutEmbedFrom) {
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    nlohmann::json field_json;
+    field_json["name"] = "embedding";
+    field_json["type"] = "float[]";
+    field_json["embed"]["model_config"] = nlohmann::json::object();
+    field_json["embed"]["model_config"]["model_name"] = "ts/e5-small";
+
+    std::vector<field> fields;
+    std::string fallback_field_type;
+    auto arr = nlohmann::json::array();
+    arr.push_back(field_json);
+
+    auto field_op = field::json_fields_to_fields(false, arr, fallback_field_type, fields);
+    ASSERT_FALSE(field_op.ok());
+    ASSERT_EQ("Property `embed` must contain a `from` property.", field_op.error());
+}
+
+TEST_F(CollectionAllFieldsTest, EmbedFromBasicValid) {
+    EmbedderManager::set_model_dir("/tmp/typesense_test/models");
+    nlohmann::json schema = R"({
+        "name": "obj_coll",
+        "fields": [
+            {"name": "name", "type": "string"},
+            {"name": "embedding", "type":"float[]", "embed":{"from": ["name"],
+                "model_config": {"model_name": "ts/e5-small"}}}
+        ]
+    })"_json;
+
+    auto obj_coll_op = collectionManager.create_collection(schema);
+
+    ASSERT_TRUE(obj_coll_op.ok());
+    Collection* obj_coll = obj_coll_op.get();
+
+    nlohmann::json doc1;
+    doc1["name"] = "One Two Three";
+
+    auto add_res = obj_coll->add(doc1.dump());
+
+    ASSERT_TRUE(add_res.ok());
+    ASSERT_TRUE(add_res.get()["name"].is_string());
+    ASSERT_TRUE(add_res.get()["embedding"].is_array());
+    ASSERT_EQ(384, add_res.get()["embedding"].size());
+
+}
+
+TEST_F(CollectionAllFieldsTest, WrongDataTypeForEmbedFrom) {
+    nlohmann::json schema = R"({
+        "name": "obj_coll",
+        "fields": [
+            {"name": "age", "type": "int32"},
+            {"name": "embedding", "type":"float[]", "embed":{"from": ["age"],
+                "model_config": {"model_name": "ts/e5-small"}}}
+        ]
+    })"_json;
+
+    auto obj_coll_op = collectionManager.create_collection(schema);
+
+    ASSERT_FALSE(obj_coll_op.ok());
+    ASSERT_EQ("Property `embed.from` can only refer to string, string array or image (for supported models) fields.", obj_coll_op.error());
+}
+
+TEST_F(CollectionAllFieldsTest, StoreInvalidInput) {
+        nlohmann::json schema = R"({
+        "name": "obj_coll",
+        "fields": [
+            {"name": "age", "type": "int32", "store": "qwerty"}
+        ]
+    })"_json;
+
+
+    auto obj_coll_op = collectionManager.create_collection(schema);
+
+    ASSERT_FALSE(obj_coll_op.ok());
+    ASSERT_EQ("The `store` property of the field `age` should be a boolean.", obj_coll_op.error());
+}
+
+TEST_F(CollectionAllFieldsTest, InvalidstemValue) {
+    nlohmann::json schema = R"({
+        "name": "test",
+        "fields": [
+            {"name": "name", "type": "string", "stem": "qwerty"}
+        ]
+    })"_json;
+    
+    auto obj_coll_op = collectionManager.create_collection(schema);
+    ASSERT_FALSE(obj_coll_op.ok());
+    ASSERT_EQ("The `stem` property of the field `name` should be a boolean.", obj_coll_op.error());
+
+    schema = R"({
+        "name": "test",
+        "fields": [
+            {"name": "name", "type": "int32", "stem": true}
+        ]
+    })"_json;
+
+    obj_coll_op = collectionManager.create_collection(schema);
+    ASSERT_FALSE(obj_coll_op.ok());
+    ASSERT_EQ("The `stem` property is only allowed for string and string[] fields.", obj_coll_op.error());
+}
+
+TEST_F(CollectionAllFieldsTest, GeopointSortValue) {
+    nlohmann::json schema = R"({
+        "name": "test",
+        "fields": [
+            {"name": "geo", "type": "geopoint", "sort": false}
+        ]
+    })"_json;
+
+    auto create_op = collectionManager.create_collection(schema);
+    ASSERT_FALSE(create_op.ok());
+    ASSERT_EQ("The `sort` property of the field `geo` having `geopoint` type cannot be `false`."
+               " The sort index is used during GeoSearch.", create_op.error());
+
+    schema = R"({
+        "name": "test",
+        "fields": [
+            {"name": "geo_array", "type": "geopoint[]", "sort": false}
+        ]
+    })"_json;
+
+    create_op = collectionManager.create_collection(schema);
+    ASSERT_FALSE(create_op.ok());
+    ASSERT_EQ("The `sort` property of the field `geo_array` having `geopoint[]` type cannot be `false`."
+              " The sort index is used during GeoSearch.", create_op.error());
+
 }
 

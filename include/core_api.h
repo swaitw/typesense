@@ -9,6 +9,10 @@ bool handle_authentication(std::map<std::string, std::string>& req_params,
                            const std::string& body, const route_path& rpath,
                            const std::string& req_auth_key);
 
+void set_alter_in_progress(bool in_progress);
+
+bool get_alter_in_progress();
+
 // Collections
 
 bool get_collections(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
@@ -32,6 +36,8 @@ bool get_export_documents(const std::shared_ptr<http_req>& req, const std::share
 bool post_add_document(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
 bool patch_update_document(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool patch_update_documents(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
 bool post_import_documents(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
@@ -60,6 +66,16 @@ bool get_preset(const std::shared_ptr<http_req>& req, const std::shared_ptr<http
 bool put_upsert_preset(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
 bool del_preset(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+//stopwords
+
+bool get_stopwords(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_stopword(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool put_upsert_stopword(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool del_stopword(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
 // Overrides
 
@@ -97,6 +113,8 @@ bool get_debug(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_
 
 bool get_health(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
+bool get_health_with_resource_usage(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
 bool post_health(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
 bool get_metrics_json(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
@@ -117,6 +135,8 @@ bool post_clear_cache(const std::shared_ptr<http_req>& req, const std::shared_pt
 
 bool post_compact_db(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
+bool post_reset_peers(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
 // Rate Limiting
 
 bool get_rate_limits(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
@@ -129,6 +149,30 @@ bool del_rate_limit(const std::shared_ptr<http_req>& req, const std::shared_ptr<
 
 bool post_rate_limit(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
 
+bool get_active_throttles(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_limit_exceed_counts(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool del_throttle(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool del_exceed(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+// Analytics
+
+bool post_create_event(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_analytics_rule(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool post_create_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool put_upsert_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool del_analytics_rules(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool post_write_analytics_to_db(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
 // Misc helpers
 
 void get_collections_for_auth(std::map<std::string, std::string>& req_params, const std::string& body,
@@ -136,8 +180,34 @@ void get_collections_for_auth(std::map<std::string, std::string>& req_params, co
                               std::vector<collection_key_t>& collections,
                               std::vector<nlohmann::json>& embedded_params_vec);
 
+void log_running_queries();
+
 bool is_doc_import_route(uint64_t route_hash);
+
+bool is_coll_create_route(uint64_t route_hash);
+
+bool is_drop_collection_route(uint64_t route_hash);
 
 bool is_doc_write_route(uint64_t route_hash);
 
 bool is_doc_del_route(uint64_t route_hash);
+
+Option<std::pair<std::string,std::string>> get_api_key_and_ip(const std::string& metadata);
+
+void init_api(uint32_t cache_num_entries);
+
+
+bool post_proxy(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+
+
+
+bool post_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool del_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool get_conversation_models(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);
+
+bool put_conversation_model(const std::shared_ptr<http_req>& req, const std::shared_ptr<http_res>& res);

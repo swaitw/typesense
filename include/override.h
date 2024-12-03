@@ -9,9 +9,11 @@ struct override_t {
 
     struct rule_t {
         std::string query;
+        std::string normalized_query;       // not actually stored, used for lowercasing etc.
         std::string match;
         bool dynamic_query = false;
         std::string filter_by;
+        std::set<std::string> tags;
     };
 
     struct add_hit_t {
@@ -38,13 +40,20 @@ struct override_t {
     std::string sort_by;
     std::string replace_query;
 
+    nlohmann::json metadata;
+
     // epoch seconds
     int64_t effective_from_ts = -1;
     int64_t effective_to_ts = -1;
 
     override_t() = default;
 
-    static Option<bool> parse(const nlohmann::json& override_json, const std::string& id, override_t& override);
+    static Option<bool> parse(const nlohmann::json& override_json, const std::string& id,
+                              override_t& override,
+                              const std::string& locale = "",
+                              const std::vector<char>& symbols_to_index = {},
+                              const std::vector<char>& token_separators = {}
+                              );
 
     nlohmann::json to_json() const;
 };

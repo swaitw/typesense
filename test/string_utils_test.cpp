@@ -3,6 +3,7 @@
 #include <iconv.h>
 #include <unicode/translit.h>
 #include <json.hpp>
+#include <join.h>
 
 TEST(StringUtilsTest, ShouldJoinString) {
     std::vector<std::string> parts = {"foo", "bar", "baz", "bazinga"};
@@ -318,6 +319,32 @@ TEST(StringUtilsTest, ContainsWord) {
     ASSERT_FALSE(StringUtils::contains_word("baz foobar", "foo"));
 }
 
+TEST(StringUtilsTest, ShouldSplitRangeFacet){
+    std::string range_facets_string = "score(fail:[0, 40], pass:[40, 100]), grade(A:[80,100], B:[60, 80], C:[40, 60])";
+    std::vector<std::string> range_facets;
+    StringUtils::split_facet(range_facets_string, range_facets);
+    ASSERT_EQ("score(fail:[0, 40], pass:[40, 100])", range_facets[0]);
+    ASSERT_EQ("grade(A:[80,100], B:[60, 80], C:[40, 60])", range_facets[1]);
+
+    std::string facets_string = "score, grade";
+    std::vector<std::string> facets;
+    StringUtils::split_facet(facets_string, facets);
+    ASSERT_EQ("score", facets[0]);
+    ASSERT_EQ("grade", facets[1]);
+
+    std::string mixed_facets_string = "score, grade(A:[80,100], B:[60, 80], C:[40, 60]), rank";
+    std::vector<std::string> mixed_facets;
+    StringUtils::split_facet(mixed_facets_string, mixed_facets);
+    ASSERT_EQ("score", mixed_facets[0]);
+    ASSERT_EQ("grade(A:[80,100], B:[60, 80], C:[40, 60])", mixed_facets[1]);
+    ASSERT_EQ("rank", mixed_facets[2]);
+
+    // empty string should produce empty list
+    std::vector<std::string> lines_empty;
+    StringUtils::split_facet("", lines_empty);
+    ASSERT_TRUE(lines_empty.empty());
+}
+
 void tokenizeTestHelper(const std::string& filter_query, const std::vector<std::string>& tokenList) {
     std::queue<std::string> tokenizeOutput;
     auto tokenize_op = StringUtils::tokenize_filter_query(filter_query, tokenizeOutput);
@@ -364,4 +391,91 @@ TEST(StringUtilsTest, TokenizeFilterQuery) {
     filter_query = "((age:<5||age:>10)&&location:(48.906,2.343,5mi))||tags:AT&T";
     tokenList = {"(", "(", "age:<5", "||", "age:>10", ")", "&&", "location:(48.906,2.343,5mi)", ")", "||", "tags:AT&T"};
     tokenizeTestHelper(filter_query, tokenList);
+
+    filter_query = "((age: <5 || age: >10) && category:= [shoes]) &&"
+                   " $Customers(customer_id:=customer_a && (product_price:>100 && product_price:<200))";
+    tokenList = {"(", "(", "age: <5", "||", "age: >10", ")", "&&", "category:= [shoes]", ")", "&&",
+                 "$Customers(customer_id:=customer_a && (product_price:>100 && product_price:<200))"};
+    tokenizeTestHelper(filter_query, tokenList);
+}
+
+void splitIncludeExcludeTestHelper(const std::string& include_exclude_fields, const std::vector<std::string>& expected) {
+    std::vector<std::string> output;
+    auto tokenize_op = StringUtils::split_include_exclude_fields(include_exclude_fields, output);
+    ASSERT_TRUE(tokenize_op.ok());
+    ASSERT_EQ(expected.size(), output.size());
+    for (auto i = 0; i < output.size(); i++) {
+        ASSERT_EQ(expected[i], output[i]);
+    }
+}
+
+TEST(StringUtilsTest, SplitIncludeExcludeFields) {
+    std::string include_fields;
+    std::vector<std::string> tokens;
+
+    include_fields = " id, title , count ";
+    tokens = {"id", "title", "count"};
+    splitIncludeExcludeTestHelper(include_fields, tokens);
+
+    include_fields = "id, $Collection(title, pref*),count";
+    tokens = {"id", "$Collection(title, pref*)", "count"};
+    splitIncludeExcludeTestHelper(include_fields, tokens);
+
+    include_fields = "id, $Collection(title, pref*), count, ";
+    tokens = {"id", "$Collection(title, pref*)", "count"};
+    splitIncludeExcludeTestHelper(include_fields, tokens);
+
+    include_fields = "$Collection(title, pref*) as coll";
+    tokens = {"$Collection(title, pref*) as coll"};
+    splitIncludeExcludeTestHelper(include_fields, tokens);
+
+    include_fields = "id, $Collection(title, pref*)  as coll , count, ";
+    tokens = {"id", "$Collection(title, pref*) as coll", "count"};
+    splitIncludeExcludeTestHelper(include_fields, tokens);
+
+    include_fields = "$Collection(title, pref*: merge) as coll";
+    tokens = {"$Collection(title, pref*: merge) as coll"};
+    splitIncludeExcludeTestHelper(include_fields, tokens);
+
+    include_fields = "$product_variants(id,$inventory(qty,sku,$retailer(id,title: merge) as retailer_info))  as variants";
+    tokens = {"$product_variants(id,$inventory(qty,sku,$retailer(id,title: merge) as retailer_info)) as variants"};
+    splitIncludeExcludeTestHelper(include_fields, tokens);
+
+    std::string exclude_fields = " id, title, $Collection(title), count,";
+    tokens = {"id", "title", "$Collection(title)", "count"};
+    splitIncludeExcludeTestHelper(exclude_fields, tokens);
+
+    exclude_fields = " id, title , count, $Collection(title), $product_variants(id,$inventory(qty,sku,$retailer(id,title)))";
+    tokens = {"id", "title", "count", "$Collection(title)", "$product_variants(id,$inventory(qty,sku,$retailer(id,title)))"};
+    splitIncludeExcludeTestHelper(exclude_fields, tokens);
+}
+
+TEST(StringUtilsTest, SplitReferenceIncludeExcludeFields) {
+    std::string include_fields = "$retailer(id,title,strategy:merge) as retailer_info, strategy:merge)  as variants, foo", token;
+    size_t index = 0;
+    auto tokenize_op = Join::split_reference_include_exclude_fields(include_fields, index, token);
+    ASSERT_TRUE(tokenize_op.ok());
+    ASSERT_EQ("$retailer(id,title,strategy:merge) as retailer_info", token);
+    ASSERT_EQ(", strategy:merge)  as variants, foo", include_fields.substr(index));
+
+    include_fields = "$inventory(qty,sku,$retailer(id,title, strategy : merge) as retailer_info)  as inventory)  as variants, foo";
+    index = 0;
+    tokenize_op = Join::split_reference_include_exclude_fields(include_fields, index, token);
+    ASSERT_TRUE(tokenize_op.ok());
+    ASSERT_EQ("$inventory(qty,sku,$retailer(id,title, strategy : merge) as retailer_info) as inventory", token);
+    ASSERT_EQ(")  as variants, foo", include_fields.substr(index));
+
+    std::string exclude_fields = "$Collection(title), $product_variants(id,$inventory(qty,sku,$retailer(id,title)))";
+    index = 0;
+    tokenize_op = Join::split_reference_include_exclude_fields(exclude_fields, index, token);
+    ASSERT_TRUE(tokenize_op.ok());
+    ASSERT_EQ("$Collection(title)", token);
+    ASSERT_EQ(", $product_variants(id,$inventory(qty,sku,$retailer(id,title)))", exclude_fields.substr(index));
+
+    exclude_fields = "$inventory(qty,sku,$retailer(id,title)), foo)";
+    index = 0;
+    tokenize_op = Join::split_reference_include_exclude_fields(exclude_fields, index, token);
+    ASSERT_TRUE(tokenize_op.ok());
+    ASSERT_EQ("$inventory(qty,sku,$retailer(id,title))", token);
+    ASSERT_EQ(", foo)", exclude_fields.substr(index));
 }

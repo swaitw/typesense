@@ -3,12 +3,14 @@
 #include <vector>
 #include <fstream>
 #include <collection_manager.h>
+#include <analytics_manager.h>
 #include "string_utils.h"
 #include "collection.h"
 
 class CollectionManagerTest : public ::testing::Test {
 protected:
     Store *store;
+    Store* analytic_store;
     CollectionManager & collectionManager = CollectionManager::get_instance();
     std::atomic<bool> quit = false;
     Collection *collection1;
@@ -21,8 +23,12 @@ protected:
         system(("rm -rf "+state_dir_path+" && mkdir -p "+state_dir_path).c_str());
 
         store = new Store(state_dir_path);
+        analytic_store = new Store(state_dir_path + "/analytics");
+
         collectionManager.init(store, 1.0, "auth_key", quit);
         collectionManager.load(8, 1000);
+
+        AnalyticsManager::get_instance().init(store, analytic_store, 5);
 
         schema = R"({
             "name": "collection1",
@@ -36,7 +42,8 @@ protected:
                 {"name": "not_stored", "type": "string", "optional": true, "index": false},
                 {"name": "points", "type": "int32"},
                 {"name": "person", "type": "object", "optional": true},
-                {"name": "vec", "type": "float[]", "num_dim": 128, "optional": true}
+                {"name": "vec", "type": "float[]", "num_dim": 128, "optional": true},
+                {"name": "product_id", "type": "string", "reference": "Products.product_id", "optional": true, "async_reference": true}
             ],
             "default_sorting_field": "points",
             "symbols_to_index":["+"],
@@ -44,7 +51,9 @@ protected:
         })"_json;
 
         sort_fields = { sort_by("points", "DESC") };
-        collection1 = collectionManager.create_collection(schema).get();
+        auto op = collectionManager.create_collection(schema);
+        ASSERT_TRUE(op.ok());
+        collection1 = op.get();
     }
 
     virtual void SetUp() {
@@ -56,6 +65,7 @@ protected:
             collectionManager.drop_collection("collection1");
             collectionManager.dispose();
             delete store;
+            delete analytic_store;
         }
     }
 };
@@ -71,12 +81,18 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
     ASSERT_EQ(0, collection1->get_collection_id());
     ASSERT_EQ(0, collection1->get_next_seq_id());
     ASSERT_EQ(facet_fields_expected, collection1->get_facet_fields());
-    ASSERT_EQ(2, collection1->get_sort_fields().size());
+    // product_id_sequence_id is also included
+    ASSERT_EQ(3, collection1->get_sort_fields().size());
     ASSERT_EQ("location", collection1->get_sort_fields()[0].name);
-    ASSERT_EQ("points", collection1->get_sort_fields()[1].name);
+    ASSERT_EQ("product_id_sequence_id", collection1->get_sort_fields()[1].name);
+    ASSERT_EQ("points", collection1->get_sort_fields()[2].name);
     ASSERT_EQ(schema.size(), collection1->get_schema().size());
     ASSERT_EQ("points", collection1->get_default_sorting_field());
     ASSERT_EQ(false, schema.at("not_stored").index);
+
+    ASSERT_EQ(1, collection1->get_reference_fields().size());
+    ASSERT_EQ("Products", collection1->get_reference_fields().at("product_id").collection);
+    ASSERT_EQ("product_id", collection1->get_reference_fields().at("product_id").field);
 
     // check storage as well
     rocksdb::Iterator* it = store->get_iterator();
@@ -118,7 +134,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested":false,
               "optional":false,
               "sort":false,
-              "type":"string"
+              "store":true,
+              "type":"string",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -129,7 +148,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested":false,
               "optional":false,
               "sort":false,
-              "type":"string"
+              "store":true,
+              "type":"string",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":true,
@@ -140,7 +162,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested":false,
               "optional":true,
               "sort":false,
-              "type":"string[]"
+              "store":true,
+              "type":"string[]",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":true,
@@ -151,7 +176,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested":false,
               "optional":true,
               "sort":true,
-              "type":"int32"
+              "store":true,
+              "type":"int32",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -162,7 +190,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested":false,
               "optional":true,
               "sort":true,
-              "type":"geopoint"
+              "store":true,
+              "type":"geopoint",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -173,7 +204,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested":false,
               "optional":true,
               "sort":false,
-              "type":"string"
+              "store":true,
+              "type":"string",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -184,7 +218,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested":false,
               "optional":false,
               "sort":true,
-              "type":"int32"
+              "store":true,
+              "type":"int32",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -196,7 +233,10 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "nested_array":2,
               "optional":true,
               "sort":false,
-              "type":"object"
+              "store":true,
+              "type":"object",
+              "range_index":false,
+              "stem":false
             },
             {
               "facet":false,
@@ -208,8 +248,41 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
               "num_dim":128,
               "optional":true,
               "sort":false,
+              "store":true,
               "type":"float[]",
-              "vec_dist":"cosine"
+              "vec_dist":"cosine",
+              "range_index":false,
+              "stem":false
+            },
+            {
+              "async_reference":true,
+              "facet":false,
+              "index":true,
+              "infix":false,
+              "locale":"",
+              "name":"product_id",
+              "nested":false,
+              "optional":true,
+              "sort":false,
+              "store":true,
+              "type":"string",
+              "reference":"Products.product_id",
+              "range_index":false,
+              "stem":false
+            },
+            {
+              "facet":false,
+              "index":true,
+              "infix":false,
+              "locale":"",
+              "name":"product_id_sequence_id",
+              "nested":false,
+              "optional":true,
+              "sort":true,
+              "store":true,
+              "type":"int64",
+              "range_index":false,
+              "stem":false
             }
           ],
           "id":0,
@@ -226,6 +299,8 @@ TEST_F(CollectionManagerTest, CollectionCreation) {
 
     auto actual_json = nlohmann::json::parse(collection_meta_json);
     expected_meta_json["created_at"] = actual_json["created_at"];
+
+
 
     ASSERT_EQ(expected_meta_json.dump(), actual_json.dump());
     ASSERT_EQ("1", next_collection_id);
@@ -253,7 +328,7 @@ TEST_F(CollectionManagerTest, ParallelCollectionCreation) {
 
     int64_t prev_id = INT32_MAX;
 
-    for(auto coll: collectionManager.get_collections()) {
+    for(auto coll: collectionManager.get_collections().get()) {
         // collections are sorted by ID, in descending order
         ASSERT_TRUE(coll->get_collection_id() < prev_id);
         prev_id = coll->get_collection_id();
@@ -265,7 +340,11 @@ TEST_F(CollectionManagerTest, ShouldInitCollection) {
             nlohmann::json::parse("{\"name\": \"foobar\", \"id\": 100, \"fields\": [{\"name\": \"org\", \"type\": "
                                   "\"string\", \"facet\": false}], \"default_sorting_field\": \"foo\"}");
 
-    Collection *collection = collectionManager.init_collection(collection_meta1, 100, store, 1.0f);
+    spp::sparse_hash_map<std::string, std::string> referenced_in;
+    spp::sparse_hash_map<std::string, std::vector<reference_pair_t>> async_referenced_ins;
+
+    Collection *collection = collectionManager.init_collection(collection_meta1, 100, store, 1.0f, referenced_in,
+                                                               async_referenced_ins);
     ASSERT_EQ("foobar", collection->get_name());
     ASSERT_EQ(100, collection->get_collection_id());
     ASSERT_EQ(1, collection->get_fields().size());
@@ -287,7 +366,8 @@ TEST_F(CollectionManagerTest, ShouldInitCollection) {
                                   "\"symbols_to_index\": [\"+\"], \"token_separators\": [\"-\"]}");
 
 
-    collection = collectionManager.init_collection(collection_meta2, 100, store, 1.0f);
+    collection = collectionManager.init_collection(collection_meta2, 100, store, 1.0f, referenced_in,
+                                                   async_referenced_ins);
     ASSERT_EQ(12345, collection->get_created_at());
 
     std::vector<char> expected_symbols = {'+'};
@@ -307,7 +387,7 @@ TEST_F(CollectionManagerTest, ShouldInitCollection) {
 }
 
 TEST_F(CollectionManagerTest, GetAllCollections) {
-    std::vector<Collection*> collection_vec = collectionManager.get_collections();
+    std::vector<Collection*> collection_vec = collectionManager.get_collections().get();
     ASSERT_EQ(1, collection_vec.size());
     ASSERT_STREQ("collection1", collection_vec[0]->get_name().c_str());
 
@@ -321,7 +401,7 @@ TEST_F(CollectionManagerTest, GetAllCollections) {
     })"_json;
 
     collectionManager.create_collection(new_schema);
-    collection_vec = collectionManager.get_collections();
+    collection_vec = collectionManager.get_collections().get();
     ASSERT_EQ(2, collection_vec.size());
 
     // most recently created collection first
@@ -336,7 +416,11 @@ TEST_F(CollectionManagerTest, RestoreRecordsOnRestart) {
     std::string json_line;
 
     while (std::getline(infile, json_line)) {
-        collection1->add(json_line);
+        auto op = collection1->add(json_line);
+        if (!op.ok()) {
+            LOG(INFO) << op.error();
+        }
+        ASSERT_TRUE(op.ok());
     }
 
     infile.close();
@@ -419,6 +503,26 @@ TEST_F(CollectionManagerTest, RestoreRecordsOnRestart) {
     ASSERT_EQ(4, results["hits"].size());
 
     tsl::htrie_map<char, field> schema = collection1->get_schema();
+    ASSERT_EQ(schema.count("product_id_sequence_id"), 1);
+
+    auto products_schema_json =
+            R"({
+                "name": "Products",
+                "fields": [
+                    {"name": "product_id", "type": "string"},
+                    {"name": "product_name", "type": "string"},
+                    {"name": "product_description", "type": "string"}
+                ]
+            })"_json;
+    auto const& collection_create_op = collectionManager.create_collection(products_schema_json);
+    ASSERT_TRUE(collection_create_op.ok());
+
+    auto async_ref_fields = collection_create_op.get()->get_async_referenced_ins();
+    ASSERT_EQ(1, async_ref_fields.size());
+    ASSERT_EQ(1, async_ref_fields.count("product_id"));
+    ASSERT_EQ(1, async_ref_fields["product_id"].size());
+    ASSERT_EQ("collection1", async_ref_fields["product_id"][0].collection);
+    ASSERT_EQ("product_id", async_ref_fields["product_id"][0].field);
 
     // recreate collection manager to ensure that it restores the records from the disk backed store
     collectionManager.dispose();
@@ -442,11 +546,17 @@ TEST_F(CollectionManagerTest, RestoreRecordsOnRestart) {
     ASSERT_EQ(0, collection1->get_collection_id());
     ASSERT_EQ(18, collection1->get_next_seq_id());
     ASSERT_EQ(facet_fields_expected, collection1->get_facet_fields());
-    ASSERT_EQ(2, collection1->get_sort_fields().size());
+    // product_id_sequence_id is also included
+    ASSERT_EQ(3, collection1->get_sort_fields().size());
     ASSERT_EQ("location", collection1->get_sort_fields()[0].name);
-    ASSERT_EQ("points", collection1->get_sort_fields()[1].name);
+    ASSERT_EQ("product_id_sequence_id", collection1->get_sort_fields()[1].name);
+    ASSERT_EQ("points", collection1->get_sort_fields()[2].name);
     ASSERT_EQ(schema.size(), collection1->get_schema().size());
     ASSERT_EQ("points", collection1->get_default_sorting_field());
+
+    ASSERT_EQ(1, collection1->get_reference_fields().size());
+    ASSERT_EQ("Products", collection1->get_reference_fields().at("product_id").collection);
+    ASSERT_EQ("product_id", collection1->get_reference_fields().at("product_id").field);
 
     auto restored_schema = collection1->get_schema();
     ASSERT_EQ(true, restored_schema.at("cast").optional);
@@ -457,23 +567,24 @@ TEST_F(CollectionManagerTest, RestoreRecordsOnRestart) {
     ASSERT_TRUE(restored_schema.at("person").nested);
     ASSERT_EQ(2, restored_schema.at("person").nested_array);
     ASSERT_EQ(128, restored_schema.at("vec").num_dim);
+    ASSERT_EQ(restored_schema.count("product_id_sequence_id"), 1);
 
     ASSERT_TRUE(collection1->get_enable_nested_fields());
 
-    ASSERT_EQ(2, collection1->get_overrides().size());
-    ASSERT_STREQ("exclude-rule", collection1->get_overrides()["exclude-rule"].id.c_str());
-    ASSERT_STREQ("include-rule", collection1->get_overrides()["include-rule"].id.c_str());
+    ASSERT_EQ(2, collection1->get_overrides().get().size());
+    ASSERT_STREQ("exclude-rule", collection1->get_overrides().get()["exclude-rule"]->id.c_str());
+    ASSERT_STREQ("include-rule", collection1->get_overrides().get()["include-rule"]->id.c_str());
 
-    const auto& synonyms = collection1->get_synonyms();
+    const auto& synonyms = collection1->get_synonyms().get();
     ASSERT_EQ(2, synonyms.size());
 
-    ASSERT_STREQ("id1", synonyms.at("id1").id.c_str());
-    ASSERT_EQ(2, synonyms.at("id1").root.size());
-    ASSERT_EQ(1, synonyms.at("id1").synonyms.size());
+    ASSERT_STREQ("id1", synonyms.at(0)->id.c_str());
+    ASSERT_EQ(2, synonyms.at(0)->root.size());
+    ASSERT_EQ(1, synonyms.at(0)->synonyms.size());
 
-    ASSERT_STREQ("id3", synonyms.at("id3").id.c_str());
-    ASSERT_EQ(0, synonyms.at("id3").root.size());
-    ASSERT_EQ(2, synonyms.at("id3").synonyms.size());
+    ASSERT_STREQ("id3", synonyms.at(1)->id.c_str());
+    ASSERT_EQ(0, synonyms.at(1)->root.size());
+    ASSERT_EQ(2, synonyms.at(1)->synonyms.size());
 
     std::vector<char> expected_symbols = {'+'};
     std::vector<char> expected_separators = {'-'};
@@ -486,6 +597,13 @@ TEST_F(CollectionManagerTest, RestoreRecordsOnRestart) {
 
     results = collection1->search("thomas", search_fields, "", facets, sort_fields, {0}, 10, 1, FREQUENCY, {false}).get();
     ASSERT_EQ(4, results["hits"].size());
+
+    async_ref_fields = collectionManager.get_collection("Products").get()->get_async_referenced_ins();
+    ASSERT_EQ(1, async_ref_fields.size());
+    ASSERT_EQ(1, async_ref_fields.count("product_id"));
+    ASSERT_EQ(1, async_ref_fields["product_id"].size());
+    ASSERT_EQ("collection1", async_ref_fields["product_id"][0].collection);
+    ASSERT_EQ("product_id", async_ref_fields["product_id"][0].field);
 }
 
 TEST_F(CollectionManagerTest, VerifyEmbeddedParametersOfScopedAPIKey) {
@@ -547,6 +665,123 @@ TEST_F(CollectionManagerTest, VerifyEmbeddedParametersOfScopedAPIKey) {
     ASSERT_EQ(1, res_obj["hits"].size());
     ASSERT_STREQ("1", results["hits"][0]["document"]["id"].get<std::string>().c_str());
     ASSERT_EQ("(year: 1922) && (points: 200)", req_params["filter_by"]);
+
+    collectionManager.drop_collection("coll1");
+}
+
+TEST_F(CollectionManagerTest, QuerySuggestionsShouldBeTrimmed) {
+    std::vector<field> fields = {field("title", field_types::STRING, false, false, true, "", -1, 1),
+                                 field("year", field_types::INT32, false),
+                                 field("points", field_types::INT32, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields, "points").get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["title"] = "Tom Sawyer";
+    doc1["year"] = 1876;
+    doc1["points"] = 100;
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+
+    Config::get_instance().set_enable_search_analytics(true);
+
+    nlohmann::json analytics_rule = R"({
+        "name": "top_search_queries",
+        "type": "popular_queries",
+        "params": {
+            "limit": 100,
+            "source": {
+                "collections": ["coll1"],
+                "events":  [{"type": "search", "name": "coll_search"}]
+            },
+            "destination": {
+                "collection": "top_queries"
+            }
+        }
+    })"_json;
+
+    auto create_op = AnalyticsManager::get_instance().create_rule(analytics_rule, false, true);
+    ASSERT_TRUE(create_op.ok());
+
+    nlohmann::json embedded_params;
+    std::map<std::string, std::string> req_params;
+    req_params["collection"] = "coll1";
+    req_params["q"] = " tom ";
+    req_params["query_by"] = "title";
+
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    json_res.clear();
+    req_params["q"] = "  ";
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    // check that suggestions have been trimmed
+    auto popular_queries = AnalyticsManager::get_instance().get_popular_queries();
+    ASSERT_EQ(2, popular_queries["top_queries"]->get_user_prefix_queries()[""].size());
+    ASSERT_EQ("tom", popular_queries["top_queries"]->get_user_prefix_queries()[""][0].query);
+    ASSERT_EQ("", popular_queries["top_queries"]->get_user_prefix_queries()[""][1].query);
+
+    collectionManager.drop_collection("coll1");
+}
+
+TEST_F(CollectionManagerTest, NoHitsQueryAggregation) {
+    std::vector<field> fields = {field("title", field_types::STRING, false, false, true, "", -1, 1),
+                                 field("year", field_types::INT32, false),
+                                 field("points", field_types::INT32, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields, "points").get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["title"] = "Tom Sawyer";
+    doc1["year"] = 1876;
+    doc1["points"] = 100;
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+
+    Config::get_instance().set_enable_search_analytics(true);
+
+    nlohmann::json analytics_rule = R"({
+        "name": "nohits_search_queries",
+        "type": "nohits_queries",
+        "params": {
+            "limit": 100,
+            "source": {
+                "collections": ["coll1"]
+            },
+            "destination": {
+                "collection": "nohits_queries"
+            }
+        }
+    })"_json;
+
+    auto create_op = AnalyticsManager::get_instance().create_rule(analytics_rule, false, true);
+    ASSERT_TRUE(create_op.ok());
+
+    nlohmann::json embedded_params;
+    std::map<std::string, std::string> req_params;
+    req_params["collection"] = "coll1";
+    req_params["q"] = "foobarbaz";
+    req_params["query_by"] = "title";
+
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    // check that no hits queries have been populated
+    auto nohits_queries = AnalyticsManager::get_instance().get_nohits_queries();
+    ASSERT_EQ(1, nohits_queries["nohits_queries"]->get_user_prefix_queries()[""].size());
+    ASSERT_EQ("foobarbaz", nohits_queries["nohits_queries"]->get_user_prefix_queries()[""][0].query);
 
     collectionManager.drop_collection("coll1");
 }
@@ -757,6 +992,55 @@ TEST_F(CollectionManagerTest, RestoreNestedDocsOnRestart) {
     collectionManager2.drop_collection("coll1");
 }
 
+TEST_F(CollectionManagerTest, RestoreCoercedDocValuesOnRestart) {
+    nlohmann::json schema = R"({
+        "name": "coll1",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "product", "type": "object" },
+          {"name": "product.price", "type": "int64" }
+        ]
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    auto doc1 = R"({
+        "product": {"price": 45.78}
+    })"_json;
+
+    auto create_op = coll1->add(doc1.dump(), CREATE);
+    ASSERT_TRUE(create_op.ok());
+
+    auto res_op = coll1->search("*", {}, "product.price:>0", {}, {}, {0}, 10, 1,
+                                token_ordering::FREQUENCY, {true});
+    ASSERT_TRUE(res_op.ok());
+    ASSERT_EQ(1, res_op.get()["found"].get<size_t>());
+
+    // create a new collection manager to ensure that it restores the records from the disk backed store
+    CollectionManager& collectionManager2 = CollectionManager::get_instance();
+    collectionManager2.init(store, 1.0, "auth_key", quit);
+    auto load_op = collectionManager2.load(8, 1000);
+
+    if(!load_op.ok()) {
+        LOG(ERROR) << load_op.error();
+    }
+
+    ASSERT_TRUE(load_op.ok());
+
+    auto restored_coll = collectionManager2.get_collection("coll1").get();
+    ASSERT_NE(nullptr, restored_coll);
+
+    res_op = restored_coll->search("*", {}, "product.price:>0", {}, {}, {0}, 10, 1,
+                                   token_ordering::FREQUENCY, {true});
+    ASSERT_TRUE(res_op.ok());
+    ASSERT_EQ(1, res_op.get()["found"].get<size_t>());
+
+    collectionManager.drop_collection("coll1");
+    collectionManager2.drop_collection("coll1");
+}
+
 TEST_F(CollectionManagerTest, DropCollectionCleanly) {
     std::ifstream infile(std::string(ROOT_DIR)+"test/multi_field_documents.jsonl");
     std::string json_line;
@@ -879,7 +1163,7 @@ TEST_F(CollectionManagerTest, Symlinking) {
     ASSERT_TRUE(drop_op.ok());
 
     // try to list collections now
-    nlohmann::json summaries = cmanager.get_collection_summaries();
+    nlohmann::json summaries = cmanager.get_collection_summaries().get();
     ASSERT_EQ(0, summaries.size());
 
     // remap alias to another non-existing collection
@@ -947,7 +1231,7 @@ TEST_F(CollectionManagerTest, LoadMultipleCollections) {
         cmanager.create_collection("collection" + std::to_string(i), 4, schema, "points").get();
     }
 
-    ASSERT_EQ(100, cmanager.get_collections().size());
+    ASSERT_EQ(100, cmanager.get_collections().get().size());
 
     cmanager.dispose();
     delete new_store;
@@ -956,7 +1240,7 @@ TEST_F(CollectionManagerTest, LoadMultipleCollections) {
     cmanager.init(new_store, 1.0, "auth_key", quit);
     cmanager.load(8, 1000);
 
-    ASSERT_EQ(100, cmanager.get_collections().size());
+    ASSERT_EQ(100, cmanager.get_collections().get().size());
 
     for(size_t i = 0; i < 100; i++) {
         collectionManager.drop_collection("collection" + std::to_string(i));
@@ -1020,10 +1304,103 @@ TEST_F(CollectionManagerTest, ParseSortByClause) {
     sort_fields.clear();
     sort_by_parsed = CollectionManager::parse_sort_by_str("_eval(brand:nike && foo:bar):DESC,points:desc ", sort_fields);
     ASSERT_TRUE(sort_by_parsed);
-    ASSERT_EQ("_eval(brand:nike && foo:bar)", sort_fields[0].name);
+    ASSERT_EQ("_eval", sort_fields[0].name);
+    ASSERT_FALSE(sort_fields[0].eval_expressions.empty());
+    ASSERT_EQ("brand:nike && foo:bar", sort_fields[0].eval_expressions[0]);
+    ASSERT_EQ(1, sort_fields[0].eval.scores.size());
+    ASSERT_EQ(1, sort_fields[0].eval.scores[0]);
     ASSERT_EQ("DESC", sort_fields[0].order);
     ASSERT_EQ("points", sort_fields[1].name);
     ASSERT_EQ("DESC", sort_fields[1].order);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("_eval([(brand:nike || brand:air):3, (brand:adidas):2]):DESC", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ("_eval", sort_fields[0].name);
+    ASSERT_EQ(2, sort_fields[0].eval_expressions.size());
+    ASSERT_EQ("brand:nike || brand:air", sort_fields[0].eval_expressions[0]);
+    ASSERT_EQ("brand:adidas", sort_fields[0].eval_expressions[1]);
+    ASSERT_EQ(2, sort_fields[0].eval.scores.size());
+    ASSERT_EQ(3, sort_fields[0].eval.scores[0]);
+    ASSERT_EQ(2, sort_fields[0].eval.scores[1]);
+    ASSERT_EQ("DESC", sort_fields[0].order);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("points:desc, loc(24.56,10.45):ASC, "
+                                                          "$Customers(product_price:DESC)", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(3, sort_fields.size());
+    ASSERT_EQ("points", sort_fields[0].name);
+    ASSERT_EQ("DESC", sort_fields[0].order);
+    ASSERT_EQ("loc(24.56,10.45)", sort_fields[1].name);
+    ASSERT_EQ("ASC", sort_fields[1].order);
+    ASSERT_EQ("$Customers(product_price:DESC)", sort_fields[2].name);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("_eval(brand:nike && foo:bar):DESC, "
+                                                          "$Customers(product_price:DESC)", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(2, sort_fields.size());
+    ASSERT_EQ("_eval", sort_fields[0].name);
+    ASSERT_FALSE(sort_fields[0].eval_expressions.empty());
+    ASSERT_EQ("brand:nike && foo:bar", sort_fields[0].eval_expressions[0]);
+    ASSERT_EQ(1, sort_fields[0].eval.scores.size());
+    ASSERT_EQ(1, sort_fields[0].eval.scores[0]);
+    ASSERT_EQ("DESC", sort_fields[0].order);
+    ASSERT_EQ("$Customers(product_price:DESC)", sort_fields[1].name);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$foo(bar:ASC), "
+                                                          "$Customers(product_price:DESC)", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(2, sort_fields.size());
+    ASSERT_EQ("$foo(bar:ASC)", sort_fields[0].name);
+    ASSERT_EQ("$Customers(product_price:DESC)", sort_fields[1].name);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$foo( _eval(brand:nike && foo:bar):DESC,points:desc) ",
+                                                          sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ("$foo( _eval(brand:nike && foo:bar):DESC,points:desc)", sort_fields[0].name);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$Customers(product_price:DESC, $foo(bar:asc))", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(2, sort_fields.size());
+    ASSERT_EQ("$Customers(product_price:DESC, )", sort_fields[0].name);
+    ASSERT_EQ("$foo(bar:asc)", sort_fields[1].name);
+    ASSERT_TRUE(sort_fields[1].is_nested_join_sort_by());
+    ASSERT_EQ(2, sort_fields[1].nested_join_collection_names.size());
+    ASSERT_EQ("Customers", sort_fields[1].nested_join_collection_names[0]);
+    ASSERT_EQ("foo", sort_fields[1].nested_join_collection_names[1]);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$foo($bar($baz(field:asc)))", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(1, sort_fields.size());
+    ASSERT_EQ("$baz(field:asc)", sort_fields[0].name);
+    ASSERT_TRUE(sort_fields[0].is_nested_join_sort_by());
+    ASSERT_EQ(3, sort_fields[0].nested_join_collection_names.size());
+    ASSERT_EQ("foo", sort_fields[0].nested_join_collection_names[0]);
+    ASSERT_EQ("bar", sort_fields[0].nested_join_collection_names[1]);
+    ASSERT_EQ("baz", sort_fields[0].nested_join_collection_names[2]);
+
+    sort_fields.clear();
+    sort_by_parsed = CollectionManager::parse_sort_by_str("$Customers(product_price:DESC, $foo($bar( _eval(brand:nike && foo:bar):DESC), baz:asc))", sort_fields);
+    ASSERT_TRUE(sort_by_parsed);
+    ASSERT_EQ(3, sort_fields.size());
+    ASSERT_EQ("$Customers(product_price:DESC, )", sort_fields[0].name);
+    ASSERT_EQ("$bar( _eval(brand:nike && foo:bar):DESC)", sort_fields[1].name);
+    ASSERT_TRUE(sort_fields[1].is_nested_join_sort_by());
+    ASSERT_EQ(3, sort_fields[1].nested_join_collection_names.size());
+    ASSERT_EQ("Customers", sort_fields[1].nested_join_collection_names[0]);
+    ASSERT_EQ("foo", sort_fields[1].nested_join_collection_names[1]);
+    ASSERT_EQ("bar", sort_fields[1].nested_join_collection_names[2]);
+    ASSERT_EQ("$foo(baz:asc)", sort_fields[2].name);
+    ASSERT_TRUE(sort_fields[2].is_nested_join_sort_by());
+    ASSERT_EQ(2, sort_fields[2].nested_join_collection_names.size());
+    ASSERT_EQ("Customers", sort_fields[2].nested_join_collection_names[0]);
+    ASSERT_EQ("foo", sort_fields[2].nested_join_collection_names[1]);
 
     sort_fields.clear();
     sort_by_parsed = CollectionManager::parse_sort_by_str("", sort_fields);
@@ -1149,8 +1526,8 @@ TEST_F(CollectionManagerTest, CloneCollection) {
     ASSERT_FALSE(coll2 == nullptr);
     ASSERT_EQ("coll2", coll2->get_name());
     ASSERT_EQ(1, coll2->get_fields().size());
-    ASSERT_EQ(1, coll2->get_synonyms().size());
-    ASSERT_EQ(1, coll2->get_overrides().size());
+    ASSERT_EQ(1, coll2->get_synonyms().get().size());
+    ASSERT_EQ(1, coll2->get_overrides().get().size());
     ASSERT_EQ("", coll2->get_fallback_field_type());
 
     ASSERT_EQ(1, coll2->get_symbols_to_index().size());
@@ -1159,4 +1536,411 @@ TEST_F(CollectionManagerTest, CloneCollection) {
     ASSERT_EQ('+', coll2->get_symbols_to_index().at(0));
     ASSERT_EQ('-', coll2->get_token_separators().at(0));
     ASSERT_EQ('?', coll2->get_token_separators().at(1));
+}
+
+TEST_F(CollectionManagerTest, ReferencedInBacklog) {
+    auto referenced_ins_backlog = collectionManager._get_referenced_in_backlog();
+    ASSERT_EQ(1, referenced_ins_backlog.count("Products"));
+
+    auto const& references = referenced_ins_backlog.at("Products");
+    ASSERT_EQ(1, references.size());
+    ASSERT_EQ("collection1", references.cbegin()->collection);
+    ASSERT_EQ("product_id", references.cbegin()->field);
+
+    auto schema_json =
+            R"({
+                "name": "Products",
+                "fields": [
+                    {"name": "product_id", "type": "string"},
+                    {"name": "name", "type": "string"}
+                ]
+            })"_json;
+
+    auto create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(create_op.ok());
+
+    referenced_ins_backlog = collectionManager._get_referenced_in_backlog();
+    ASSERT_EQ(0, referenced_ins_backlog.count("Products"));
+
+    auto get_reference_field_op = create_op.get()->get_referenced_in_field_with_lock("collection1");
+    ASSERT_TRUE(get_reference_field_op.ok());
+    ASSERT_EQ("product_id", get_reference_field_op.get());
+
+    get_reference_field_op = create_op.get()->get_referenced_in_field_with_lock("foo");
+    ASSERT_FALSE(get_reference_field_op.ok());
+    ASSERT_EQ("Could not find any field in `Products` referencing the collection `foo`.", get_reference_field_op.error());
+}
+
+TEST_F(CollectionManagerTest, ExcludeFieldsInCollectionListing) {
+    auto schema_json =
+            R"({
+                "name": "products",
+                "fields": [
+                    {"name": "product_id", "type": "string"},
+                    {"name": "name", "type": "string"},
+                    {"name": "points", "type": "int32"}
+                ],
+                "default_sorting_field": "points"
+            })"_json;
+
+    auto create_op = collectionManager.create_collection(schema_json);
+    ASSERT_TRUE(create_op.ok());
+
+    nlohmann::json coll_json_summaries = collectionManager.get_collection_summaries(10, 0, {"fields"}).get();
+    ASSERT_EQ(2, coll_json_summaries.size());
+
+    for(auto coll_json: coll_json_summaries) {
+        ASSERT_FALSE(coll_json.contains("fields"));
+    }
+
+    coll_json_summaries = collectionManager.get_collection_summaries(10, 0, {}).get();
+    ASSERT_EQ(2, coll_json_summaries.size());
+
+    for(auto coll_json: coll_json_summaries) {
+        ASSERT_TRUE(coll_json.contains("fields"));
+    }
+}
+
+TEST_F(CollectionManagerTest, CollectionCreationWithMetadata) {
+    CollectionManager & collectionManager3 = CollectionManager::get_instance();
+
+    nlohmann::json schema1 = R"({
+        "name": "collection_meta",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "value.color", "type": "string", "optional": false, "facet": true },
+          {"name": "value.r", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.g", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.b", "type": "int32", "optional": false, "facet": true }
+        ],
+        "metadata": "abc"
+    })"_json;
+
+    auto op = collectionManager.create_collection(schema1);
+    ASSERT_FALSE(op.ok());
+    ASSERT_EQ("The `metadata` value should be an object.", op.error());
+
+    nlohmann::json schema2 = R"({
+        "name": "collection_meta",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "value.color", "type": "string", "optional": false, "facet": true },
+          {"name": "value.r", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.g", "type": "int32", "optional": false, "facet": true },
+          {"name": "value.b", "type": "int32", "optional": false, "facet": true }
+        ],
+        "metadata": {
+            "batch_job":"",
+            "indexed_from":"2023-04-20T00:00:00.000Z",
+            "total_docs": 0
+        }
+    })"_json;
+
+    op = collectionManager.create_collection(schema2);
+    ASSERT_TRUE(op.ok());
+    Collection* coll1 = op.get();
+
+    std::string collection_meta_json;
+    nlohmann::json collection_meta;
+    std::string next_seq_id;
+    std::string next_collection_id;
+
+    store->get(Collection::get_meta_key("collection_meta"), collection_meta_json);
+    store->get(Collection::get_next_seq_id_key("collection_meta"), next_seq_id);
+
+    //LOG(INFO) << collection_meta_json;
+
+    nlohmann::json expected_meta_json = R"(
+        {
+            "created_at":1705482381,
+            "default_sorting_field":"",
+            "enable_nested_fields":true,
+            "fallback_field_type":"",
+            "fields":[
+                {
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.color",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":false,
+                    "store":true,
+                    "type":"string",
+                    "range_index":false,
+                    "stem":false
+                },
+                {
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.r",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                },{
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.g",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                },{
+                    "facet":true,
+                    "index":true,
+                    "infix":false,
+                    "locale":"",
+                    "name":"value.b",
+                    "nested":true,
+                    "nested_array":2,
+                    "optional":false,
+                    "sort":true,
+                    "store":true,
+                    "type":"int32",
+                    "range_index":false,
+                    "stem":false
+                }
+            ],
+            "id":1,
+            "metadata":{
+                "batch_job":"",
+                "indexed_from":"2023-04-20T00:00:00.000Z",
+                "total_docs":0
+            },
+            "name":"collection_meta",
+            "num_memory_shards":4,
+            "symbols_to_index":[],
+            "token_separators":[]
+    })"_json;
+
+    auto actual_json = nlohmann::json::parse(collection_meta_json);
+    expected_meta_json["created_at"] = actual_json["created_at"];
+
+    ASSERT_EQ(expected_meta_json.dump(), actual_json.dump());
+
+    // metadata should exist as part of collection summary
+    auto coll_summary = coll1->get_summary_json();
+    ASSERT_EQ(expected_meta_json["metadata"].dump(), coll_summary["metadata"].dump());
+
+    // if no metadata is given, the key should not be present in response
+    schema2 = R"({
+        "name": "coll2",
+        "enable_nested_fields": true,
+        "fields": [
+          {"name": "value.color", "type": "string"}
+        ]
+    })"_json;
+
+    op = collectionManager.create_collection(schema2);
+    ASSERT_TRUE(op.ok());
+    Collection* coll2 = op.get();
+    ASSERT_EQ(0, coll2->get_summary_json().count("metadata"));
+}
+
+TEST_F(CollectionManagerTest, PopulateReferencedIns) {
+    std::vector<std::string> collection_meta_jsons = {
+            R"({
+                "name": "A",
+                "fields": [
+                  {"name": "a_id", "type": "string"}
+                ]
+            })"_json.dump(),
+            R"({
+                "name": "B",
+                "fields": [
+                  {"name": "b_id", "type": "string"},
+                  {"name": "a_ref", "type": "string", "reference": "A.a_id"},
+                  {"name": "c_ref", "type": "string", "reference": "C.c_id", "async_reference": true}
+                ]
+            })"_json.dump(),
+            R"({
+                "name": "C",
+                "fields": [
+                  {"name": "c_id", "type": "string"}
+                ]
+            })"_json.dump(),
+    };
+    std::map<std::string, spp::sparse_hash_map<std::string, std::string>> referenced_ins;
+    std::map<std::string, spp::sparse_hash_map<std::string, std::vector<reference_pair_t>>> async_referenced_ins;
+
+    for (const auto &collection_meta_json: collection_meta_jsons) {
+        CollectionManager::_populate_referenced_ins(collection_meta_json, referenced_ins, async_referenced_ins);
+    }
+
+    ASSERT_EQ(2, referenced_ins.size());
+    ASSERT_EQ(1, referenced_ins.count("A"));
+    ASSERT_EQ(1, referenced_ins["A"].size());
+    ASSERT_EQ(1, referenced_ins["A"].count("B"));
+    ASSERT_EQ("a_ref", referenced_ins["A"]["B"]);
+
+    ASSERT_EQ(1, referenced_ins.count("C"));
+    ASSERT_EQ(1, referenced_ins["C"].size());
+    ASSERT_EQ(1, referenced_ins["C"].count("B"));
+    ASSERT_EQ("c_ref", referenced_ins["C"]["B"]);
+
+    ASSERT_EQ(1, async_referenced_ins.count("C"));
+    ASSERT_EQ(1, async_referenced_ins["C"].size());
+    ASSERT_EQ(1, async_referenced_ins["C"].count("c_id"));
+    ASSERT_EQ(1, async_referenced_ins["C"]["c_id"].size());
+    ASSERT_EQ("B", async_referenced_ins["C"]["c_id"][0].collection);
+    ASSERT_EQ("c_ref", async_referenced_ins["C"]["c_id"][0].field);
+}
+
+TEST_F(CollectionManagerTest, CollectionPagination) {
+    //remove all collections first
+    auto collections = collectionManager.get_collections().get();
+    for(auto collection : collections) {
+        collectionManager.drop_collection(collection->get_name());
+    }
+
+    //create few collections
+    for(size_t i = 0; i < 5; i++) {
+        nlohmann::json coll_json = R"({
+                "name": "cp",
+                "fields": [
+                    {"name": "title", "type": "string"}
+                ]
+            })"_json;
+        coll_json["name"] = coll_json["name"].get<std::string>() + std::to_string(i + 1);
+        auto coll_op = collectionManager.create_collection(coll_json);
+        ASSERT_TRUE(coll_op.ok());
+    }
+
+    uint32_t limit = 0, offset = 0;
+
+    //limit collections by 2
+    limit=2;
+    auto collection_op = collectionManager.get_collections(limit);
+    auto collections_vec = collection_op.get();
+    ASSERT_EQ(2, collections_vec.size());
+    ASSERT_EQ("cp2", collections_vec[0]->get_name());
+    ASSERT_EQ("cp5", collections_vec[1]->get_name());
+
+    //get 2 collection from offset 3
+    offset=3;
+    collection_op = collectionManager.get_collections(limit, offset);
+    collections_vec = collection_op.get();
+    ASSERT_EQ(2, collections_vec.size());
+    ASSERT_EQ("cp1", collections_vec[0]->get_name());
+    ASSERT_EQ("cp4", collections_vec[1]->get_name());
+
+    //get all collection except first
+    offset=1; limit=0;
+    collection_op = collectionManager.get_collections(limit, offset);
+    collections_vec = collection_op.get();
+    ASSERT_EQ(4, collections_vec.size());
+    ASSERT_EQ("cp5", collections_vec[0]->get_name());
+    ASSERT_EQ("cp3", collections_vec[1]->get_name());
+    ASSERT_EQ("cp1", collections_vec[2]->get_name());
+    ASSERT_EQ("cp4", collections_vec[3]->get_name());
+
+    //get last collection
+    offset=4, limit=1;
+    collection_op = collectionManager.get_collections(limit, offset);
+    collections_vec = collection_op.get();
+    ASSERT_EQ(1, collections_vec.size());
+    ASSERT_EQ("cp4", collections_vec[0]->get_name());
+
+    //if limit is greater than number of collection then return all from offset
+    offset=0; limit=8;
+    collection_op = collectionManager.get_collections(limit, offset);
+    collections_vec = collection_op.get();
+    ASSERT_EQ(5, collections_vec.size());
+    ASSERT_EQ("cp2", collections_vec[0]->get_name());
+    ASSERT_EQ("cp5", collections_vec[1]->get_name());
+    ASSERT_EQ("cp3", collections_vec[2]->get_name());
+    ASSERT_EQ("cp1", collections_vec[3]->get_name());
+    ASSERT_EQ("cp4", collections_vec[4]->get_name());
+
+    offset=3; limit=4;
+    collection_op = collectionManager.get_collections(limit, offset);
+    collections_vec = collection_op.get();
+    ASSERT_EQ(2, collections_vec.size());
+    ASSERT_EQ("cp1", collections_vec[0]->get_name());
+    ASSERT_EQ("cp4", collections_vec[1]->get_name());
+
+    //invalid offset
+    offset=6; limit=0;
+    collection_op = collectionManager.get_collections(limit, offset);
+    ASSERT_FALSE(collection_op.ok());
+    ASSERT_EQ("Invalid offset param.", collection_op.error());
+}
+
+TEST_F(CollectionManagerTest, HideQueryFromAnalytics) {
+    std::vector<field> fields = {field("title", field_types::STRING, false, false, true, "", -1, 1),
+                                 field("year", field_types::INT32, false),
+                                 field("points", field_types::INT32, false),};
+
+    Collection* coll3 = collectionManager.create_collection("coll3", 1, fields, "points").get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["title"] = "Tom Sawyer";
+    doc1["year"] = 1876;
+    doc1["points"] = 100;
+
+    ASSERT_TRUE(coll3->add(doc1.dump()).ok());
+
+    Config::get_instance().set_enable_search_analytics(true);
+
+    nlohmann::json analytics_rule = R"({
+        "name": "hide_search_queries",
+        "type": "popular_queries",
+        "params": {
+            "limit": 100,
+            "source": {
+                "collections": ["coll3"],
+                "events":  [{"type": "search", "name": "coll_search3"}]
+            },
+            "destination": {
+                "collection": "top_queries2"
+            }
+        }
+    })"_json;
+
+    auto create_op = AnalyticsManager::get_instance().create_rule(analytics_rule, false, true);
+    ASSERT_TRUE(create_op.ok());
+
+    nlohmann::json embedded_params;
+    std::string json_res;
+
+    std::map<std::string, std::string> req_params;
+    req_params["collection"] = "coll3";
+    req_params["q"] = "tom";
+    req_params["query_by"] = "title";
+    req_params["enable_analytics"] = "false";
+
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    auto popular_queries = AnalyticsManager::get_instance().get_popular_queries();
+    ASSERT_EQ(0, popular_queries["top_queries2"]->get_user_prefix_queries().size());
+
+    req_params["enable_analytics"] = "true";
+
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+    ASSERT_TRUE(search_op.ok());
+
+    popular_queries = AnalyticsManager::get_instance().get_popular_queries();
+    ASSERT_EQ(1, popular_queries["top_queries2"]->get_user_prefix_queries().size());
+
+    collectionManager.drop_collection("coll3");
 }

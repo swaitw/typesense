@@ -203,9 +203,12 @@ TEST_F(CollectionSpecificTest, ExactSingleFieldMatch) {
                                  spp::sparse_hash_set<std::string>(), spp::sparse_hash_set<std::string>(), 10, "", 30,
                                  4, "title", 10).get();
 
+
     ASSERT_EQ(2, results["hits"].size());
     ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
     ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["typo_prefix_score"]);
+    ASSERT_EQ(2, results["hits"][1]["text_match_info"]["typo_prefix_score"]);
 
     // with typo_tokens_threshold = 1, only exact token match is fetched
     results = coll1->search("charger", {"title", "description"}, "", {}, {}, {2}, 10,
@@ -215,6 +218,7 @@ TEST_F(CollectionSpecificTest, ExactSingleFieldMatch) {
 
     ASSERT_EQ(1, results["hits"].size());
     ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["typo_prefix_score"]);
 
     collectionManager.drop_collection("coll1");
 }
@@ -251,6 +255,7 @@ TEST_F(CollectionSpecificTest, CheckProgressiveTypoSearching) {
 
     ASSERT_EQ(1, results["hits"].size());
     ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ(2, results["hits"][0]["text_match_info"]["typo_prefix_score"]);
 
     // with typo_tokens_threshold = 10, both matches are fetched
     results = coll1->search("convenient", {"title", "description"}, "", {}, {}, {2}, 10,
@@ -261,6 +266,8 @@ TEST_F(CollectionSpecificTest, CheckProgressiveTypoSearching) {
     ASSERT_EQ(2, results["hits"].size());
     ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
     ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ(2, results["hits"][0]["text_match_info"]["typo_prefix_score"]);
+    ASSERT_EQ(4, results["hits"][1]["text_match_info"]["typo_prefix_score"]);
 
     collectionManager.drop_collection("coll1");
 }
@@ -1076,7 +1083,9 @@ TEST_F(CollectionSpecificTest, CrossFieldMatchingExactMatchOnSingleField) {
 
     ASSERT_EQ(2, results["hits"].size());
     ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ(0, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
 
     results = coll1->search("john vegatable farmer", {"name", "description"},
                             "", {}, {}, {1, 1}, 10,
@@ -1087,7 +1096,9 @@ TEST_F(CollectionSpecificTest, CrossFieldMatchingExactMatchOnSingleField) {
 
     ASSERT_EQ(2, results["hits"].size());
     ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ(0, results["hits"][0]["text_match_info"]["num_tokens_dropped"]);
     ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+    ASSERT_EQ(0, results["hits"][1]["text_match_info"]["num_tokens_dropped"]);
 
     collectionManager.drop_collection("coll1");
 }
@@ -2431,8 +2442,8 @@ TEST_F(CollectionSpecificTest, PhraseSearch) {
     ASSERT_EQ("1", results["hits"][0]["document"]["id"].get<std::string>());
     ASSERT_EQ("0", results["hits"][1]["document"]["id"].get<std::string>());
 
-    // with phrase search
-    results = coll1->search(R"("down there by")", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}, 10).get();
+    // with phrase search (with padded space before after double quote
+    results = coll1->search(R"(" down there by ")", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}, 10).get();
     ASSERT_EQ(1, results["hits"].size());
     ASSERT_EQ("1", results["hits"][0]["document"]["id"].get<std::string>());
     ASSERT_EQ("<mark>Down</mark> <mark>There</mark> <mark>by</mark> the Train", results["hits"][0]["highlights"][0]["snippet"].get<std::string>());
@@ -2475,6 +2486,9 @@ TEST_F(CollectionSpecificTest, PhraseSearch) {
     // phrase with normal non-matching token
     results = coll1->search(R"("by the" state)", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}, 10).get();
     ASSERT_EQ(0, results["hits"].size());
+
+    results = coll1->search(R"("by the" and)", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}, 10).get();
+    ASSERT_EQ(1, results["hits"].size());
 
     // phrase with normal matching token
     results = coll1->search(R"("by the" and)", {"title"}, "", {}, {}, {0}, 10, 1, FREQUENCY, {false}, 10).get();
@@ -2579,6 +2593,50 @@ TEST_F(CollectionSpecificTest, PhraseSearchMultipleFields) {
                             "description: about", {}, {}, {2, 2}, 10, 1, FREQUENCY, {true, true}, 10).get();
 
     ASSERT_EQ(1, results["hits"].size());
+
+    collectionManager.drop_collection("coll1");
+}
+
+TEST_F(CollectionSpecificTest, PhraseSearchMultipleFieldsWithWeights) {
+    std::vector<field> fields = {field("title", field_types::STRING, false),
+                                 field("description", field_types::STRING, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields).get();
+
+    nlohmann::json doc1;
+    doc1["id"] = "0";
+    doc1["title"] = "And then there were none";
+    doc1["description"] = "A tale about prisioners stuck in an island";
+
+    nlohmann::json doc2;
+    doc2["id"] = "1";
+    doc2["title"] = "Mystery Island";
+    doc2["description"] = "And then there were none - a novel";
+
+    ASSERT_TRUE(coll1->add(doc1.dump()).ok());
+    ASSERT_TRUE(coll1->add(doc2.dump()).ok());
+
+    // weight title more than description
+    auto results = coll1->search(R"("there were none")", {"title", "description"},
+                                 "", {}, {}, {2, 2}, 10, 1, FREQUENCY, {true, true}, 10,
+                                 spp::sparse_hash_set<std::string>(),
+                                 spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 40, {}, {}, {}, 0,
+                                 "<mark>", "</mark>", {10, 2}).get();
+
+    ASSERT_EQ(2, results["hits"].size());
+    ASSERT_EQ("0", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("1", results["hits"][1]["document"]["id"].get<std::string>());
+
+    // weight description more than title
+    results = coll1->search(R"("there were none")", {"title", "description"},
+                            "", {}, {}, {2, 2}, 10, 1, FREQUENCY, {true, true}, 10,
+                            spp::sparse_hash_set<std::string>(),
+                            spp::sparse_hash_set<std::string>(), 10, "", 30, 4, "", 40, {}, {}, {}, 0,
+                            "<mark>", "</mark>", {2, 10}).get();
+
+    ASSERT_EQ(2, results["hits"].size());
+    ASSERT_EQ("1", results["hits"][0]["document"]["id"].get<std::string>());
+    ASSERT_EQ("0", results["hits"][1]["document"]["id"].get<std::string>());
 
     collectionManager.drop_collection("coll1");
 }
@@ -2830,6 +2888,36 @@ TEST_F(CollectionSpecificTest, NonIndexField) {
     ASSERT_EQ(1, results["hits"].size());
     ASSERT_EQ(1, coll1->_get_index()->_get_search_index().size());
 
+    std::map<std::string, std::string> req_params = {
+            {"collection", "coll1"},
+            {"q", "*"},
+            {"include_fields", "*, "}
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+
+    results = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, results["hits"].size());
+    ASSERT_EQ(3, results["hits"][0].at("document").size());
+    ASSERT_EQ(1, results["hits"][0].at("document").count("description"));
+
+    req_params = {
+            {"collection", "coll1"},
+            {"q", "*"},
+            {"include_fields", "*, title"}  // Adding a field name overrides include all wildcard
+    };
+
+    collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+
+    results = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, results["hits"].size());
+    ASSERT_EQ(1, results["hits"][0].at("document").size());
+    ASSERT_EQ(1, results["hits"][0].at("document").count("title"));
+
     collectionManager.drop_collection("coll1");
 }
 
@@ -2918,3 +3006,58 @@ TEST_F(CollectionSpecificTest, DontHighlightPunctuation) {
     collectionManager.drop_collection("coll1");
 }
 
+TEST_F(CollectionSpecificTest, ExactMatchWithoutClosingSymbol) {
+    std::vector<field> fields = {field("title", field_types::STRING, false),};
+
+    Collection* coll1 = collectionManager.create_collection("coll1", 1, fields).get();
+
+    std::vector<std::vector<std::string>> records = {
+            {"Hampi"},
+            {"Mahabalipuram"},
+            {"Taj Mahal"},
+            {"Mysore Palace"}
+    };
+
+    for(size_t i=0; i<records.size(); i++) {
+        nlohmann::json doc;
+
+        doc["id"] = std::to_string(i);
+        doc["title"] = records[i][0];
+
+        ASSERT_TRUE(coll1->add(doc.dump()).ok());
+    }
+
+    std::map<std::string, std::string> req_params = {
+            {"collection", "coll1"},
+            {"q", "\"Hamp"},
+            {"query_by", "title"},
+    };
+    nlohmann::json embedded_params;
+    std::string json_res;
+    auto now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+
+    nlohmann::json result = nlohmann::json::parse(json_res);
+    ASSERT_EQ(1, result["hits"].size());
+    ASSERT_EQ("0", result["hits"][0]["document"]["id"]);
+    ASSERT_EQ("Hampi", result["hits"][0]["document"]["title"]);
+
+    req_params = {
+            {"collection", "coll1"},
+            {"q", "\"Mah"},
+            {"query_by", "title"},
+    };
+    now_ts = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+    search_op = collectionManager.do_search(req_params, embedded_params, json_res, now_ts);
+
+    result = nlohmann::json::parse(json_res);
+    ASSERT_EQ(2, result["hits"].size());
+    ASSERT_EQ("2", result["hits"][0]["document"]["id"]);
+    ASSERT_EQ("Taj Mahal", result["hits"][0]["document"]["title"]);
+    ASSERT_EQ("1", result["hits"][1]["document"]["id"]);
+    ASSERT_EQ("Mahabalipuram", result["hits"][1]["document"]["title"]);
+}

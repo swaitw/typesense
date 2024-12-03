@@ -99,6 +99,8 @@ public:
 class ReplicationState : public braft::StateMachine {
 private:
     static constexpr const char* db_snapshot_name = "db_snapshot";
+    static constexpr const char* analytics_db_snapshot_name = "analytics_db_snapshot";
+    static constexpr const char* BATCHED_INDEXER_STATE_KEY = "$BI";
 
     mutable std::shared_mutex node_mutex;
 
@@ -109,6 +111,7 @@ private:
     BatchedIndexer* batched_indexer;
 
     Store* store;
+    Store* analytics_store;
 
     ThreadPool* thread_pool;
     http_message_dispatcher* message_dispatcher;
@@ -126,6 +129,7 @@ private:
     std::string raft_dir_path;
 
     std::string ext_snapshot_path;
+    std::atomic<bool> ext_snapshot_succeeded;
 
     int election_timeout_interval_ms;
 
@@ -136,8 +140,12 @@ private:
     std::atomic<bool> shutting_down;
     std::atomic<size_t> pending_writes;
 
+    std::atomic<size_t> snapshot_in_progress;
+
     const uint64_t snapshot_interval_s;     // frequency of actual snapshotting
     uint64_t last_snapshot_ts;              // when last snapshot ran
+
+    butil::EndPoint peering_endpoint;
 
 public:
 
@@ -145,7 +153,7 @@ public:
     static constexpr const char* meta_dir_name = "meta";
     static constexpr const char* snapshot_dir_name = "snapshot";
 
-    ReplicationState(HttpServer* server, BatchedIndexer* batched_indexer, Store* store,
+    ReplicationState(HttpServer* server, BatchedIndexer* batched_indexer, Store* store, Store* analytics_store,
                      ThreadPool* thread_pool, http_message_dispatcher* message_dispatcher,
                      bool api_uses_ssl, const Config* config,
                      size_t num_collections_parallel_load, size_t num_documents_parallel_load);
@@ -163,11 +171,14 @@ public:
     void read(const std::shared_ptr<http_res>& response);
 
     // updates cluster membership
-    void refresh_nodes(const std::string & nodes);
+    void refresh_nodes(const std::string & nodes, const size_t raft_counter,
+                       const std::atomic<bool>& reset_peers_on_error);
 
     void refresh_catchup_status(bool log_msg);
 
     bool trigger_vote();
+
+    bool reset_peers();
 
     bool has_leader_term() const {
         return leader_term.load(butil::memory_order_acquire) > 0;
@@ -200,6 +211,8 @@ public:
 
     void set_ext_snapshot_path(const std::string &snapshot_path);
 
+    bool get_ext_snapshot_succeeded();
+
     const std::string& get_ext_snapshot_path() const;
 
     // for timed snapshots
@@ -229,6 +242,12 @@ public:
 
     nlohmann::json get_status();
 
+    std::string get_leader_url() const;
+
+    static Option<bool> handle_gzip(const std::shared_ptr<http_req>& request);
+
+    void decr_pending_writes();
+
 private:
 
     friend class ReplicationClosure;
@@ -241,6 +260,7 @@ private:
         braft::SnapshotWriter* writer;
         std::string state_dir_path;
         std::string db_snapshot_path;
+        std::string analytics_db_snapshot_path;
         std::string ext_snapshot_path;
         braft::Closure* done;
     };

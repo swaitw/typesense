@@ -1,449 +1,11 @@
 #include <store.h>
 #include "field.h"
 #include "magic_enum.hpp"
+#include "embedder_manager.h"
 #include <stack>
+#include <collection_manager.h>
+#include <regex>
 
-Option<bool> filter::parse_geopoint_filter_value(std::string& raw_value,
-                                                 const std::string& format_err_msg,
-                                                 std::string& processed_filter_val,
-                                                 NUM_COMPARATOR& num_comparator) {
-
-    num_comparator = LESS_THAN_EQUALS;
-
-    if(!(raw_value[0] == '(' && raw_value[raw_value.size() - 1] == ')')) {
-        return Option<bool>(400, format_err_msg);
-    }
-
-    std::vector<std::string> filter_values;
-    auto raw_val_without_paran = raw_value.substr(1, raw_value.size() - 2);
-    StringUtils::split(raw_val_without_paran, filter_values, ",");
-
-    // we will end up with: "10.45 34.56 2 km" or "10.45 34.56 2mi" or a geo polygon
-
-    if(filter_values.size() < 3) {
-        return Option<bool>(400, format_err_msg);
-    }
-
-    // do validation: format should match either a point + radius or polygon
-
-    size_t num_floats = 0;
-    for(const auto& fvalue: filter_values) {
-        if(StringUtils::is_float(fvalue)) {
-            num_floats++;
-        }
-    }
-
-    bool is_polygon = (num_floats == filter_values.size());
-    if(!is_polygon) {
-        // we have to ensure that this is a point + radius match
-        if(!StringUtils::is_float(filter_values[0]) || !StringUtils::is_float(filter_values[1])) {
-            return Option<bool>(400, format_err_msg);
-        }
-    }
-
-    if(is_polygon) {
-        processed_filter_val = raw_val_without_paran;
-    } else {
-        // point + radius
-        // filter_values[2] is distance, get the unit, validate it and split on that
-        if(filter_values[2].size() < 2) {
-            return Option<bool>(400, "Unit must be either `km` or `mi`.");
-        }
-
-        std::string unit = filter_values[2].substr(filter_values[2].size()-2, 2);
-
-        if(unit != "km" && unit != "mi") {
-            return Option<bool>(400, "Unit must be either `km` or `mi`.");
-        }
-
-        std::vector<std::string> dist_values;
-        StringUtils::split(filter_values[2], dist_values, unit);
-
-        if(dist_values.size() != 1) {
-            return Option<bool>(400, format_err_msg);
-        }
-
-        if(!StringUtils::is_float(dist_values[0])) {
-            return Option<bool>(400, format_err_msg);
-        }
-
-        processed_filter_val = filter_values[0] + ", " + filter_values[1] + ", " + // co-ords
-                               dist_values[0] + ", " +  unit;           // X km
-    }
-
-    return Option<bool>(true);
-}
-
-bool isOperator(const std::string& expression) {
-    return expression == "&&" || expression == "||";
-}
-
-// https://en.wikipedia.org/wiki/Shunting_yard_algorithm
-Option<bool> toPostfix(std::queue<std::string>& tokens, std::queue<std::string>& postfix) {
-    std::stack<std::string> operatorStack;
-
-    while (!tokens.empty()) {
-        auto expression = tokens.front();
-        tokens.pop();
-
-        if (isOperator(expression)) {
-            // We only have two operators &&, || having the same precedence and both being left associative.
-            while (!operatorStack.empty() && operatorStack.top() != "(") {
-                postfix.push(operatorStack.top());
-                operatorStack.pop();
-            }
-
-            operatorStack.push(expression);
-        } else if (expression == "(") {
-            operatorStack.push(expression);
-        } else if (expression == ")") {
-            while (!operatorStack.empty() && operatorStack.top() != "(") {
-                postfix.push(operatorStack.top());
-                operatorStack.pop();
-            }
-
-            if (operatorStack.empty() || operatorStack.top() != "(") {
-                return Option<bool>(400, "Could not parse the filter query: unbalanced parentheses.");
-            }
-            operatorStack.pop();
-        } else {
-            postfix.push(expression);
-        }
-    }
-
-    while (!operatorStack.empty()) {
-        if (operatorStack.top() == "(") {
-            return Option<bool>(400, "Could not parse the filter query: unbalanced parentheses.");
-        }
-        postfix.push(operatorStack.top());
-        operatorStack.pop();
-    }
-
-    return Option<bool>(true);
-}
-
-Option<bool> toFilter(const std::string expression,
-                      filter& filter_exp,
-                      const tsl::htrie_map<char, field>& search_schema,
-                      const Store* store,
-                      const std::string& doc_id_prefix) {
-    // split into [field_name, value]
-    size_t found_index = expression.find(':');
-    if (found_index == std::string::npos) {
-        return Option<bool>(400, "Could not parse the filter query.");
-    }
-    std::string&& field_name = expression.substr(0, found_index);
-    StringUtils::trim(field_name);
-    if (field_name == "id") {
-        std::string&& raw_value = expression.substr(found_index + 1, std::string::npos);
-        StringUtils::trim(raw_value);
-        std::string empty_filter_err = "Error with filter field `id`: Filter value cannot be empty.";
-        if (raw_value.empty()) {
-            return Option<bool>(400, empty_filter_err);
-        }
-        filter_exp = {field_name, {}, {}};
-        NUM_COMPARATOR id_comparator = EQUALS;
-        size_t filter_value_index = 0;
-        if (raw_value[0] == '=') {
-            id_comparator = EQUALS;
-            while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
-        } else if (raw_value.size() >= 2 && raw_value[0] == '!' && raw_value[1] == '=') {
-            return Option<bool>(400, "Not equals filtering is not supported on the `id` field.");
-        }
-        if (filter_value_index != 0) {
-            raw_value = raw_value.substr(filter_value_index);
-        }
-        if (raw_value.empty()) {
-            return Option<bool>(400, empty_filter_err);
-        }
-        if (raw_value[0] == '[' && raw_value[raw_value.size() - 1] == ']') {
-            std::vector<std::string> doc_ids;
-            StringUtils::split_to_values(raw_value.substr(1, raw_value.size() - 2), doc_ids);
-            for (std::string& doc_id: doc_ids) {
-                // we have to convert the doc_id to seq id
-                std::string seq_id_str;
-                StoreStatus seq_id_status = store->get(doc_id_prefix + doc_id, seq_id_str);
-                if (seq_id_status != StoreStatus::FOUND) {
-                    continue;
-                }
-                filter_exp.values.push_back(seq_id_str);
-                filter_exp.comparators.push_back(id_comparator);
-            }
-        } else {
-            std::vector<std::string> doc_ids;
-            StringUtils::split_to_values(raw_value, doc_ids); // to handle backticks
-            std::string seq_id_str;
-            StoreStatus seq_id_status = store->get(doc_id_prefix + doc_ids[0], seq_id_str);
-            if (seq_id_status == StoreStatus::FOUND) {
-                filter_exp.values.push_back(seq_id_str);
-                filter_exp.comparators.push_back(id_comparator);
-            }
-        }
-        return Option<bool>(true);
-    }
-
-    auto field_it = search_schema.find(field_name);
-
-    if (field_it == search_schema.end()) {
-        return Option<bool>(404, "Could not find a filter field named `" + field_name + "` in the schema.");
-    }
-
-    if (field_it->num_dim > 0) {
-        return Option<bool>(404, "Cannot filter on vector field `" + field_name + "`.");
-    }
-
-    const field& _field = field_it.value();
-    std::string&& raw_value = expression.substr(found_index + 1, std::string::npos);
-    StringUtils::trim(raw_value);
-    // skip past optional `:=` operator, which has no meaning for non-string fields
-    if (!_field.is_string() && raw_value[0] == '=') {
-        size_t filter_value_index = 0;
-        while (raw_value[++filter_value_index] == ' ');
-        raw_value = raw_value.substr(filter_value_index);
-    }
-    if (_field.is_integer() || _field.is_float()) {
-        // could be a single value or a list
-        if (raw_value[0] == '[' && raw_value[raw_value.size() - 1] == ']') {
-            std::vector<std::string> filter_values;
-            StringUtils::split(raw_value.substr(1, raw_value.size() - 2), filter_values, ",");
-            filter_exp = {field_name, {}, {}};
-            for (std::string& filter_value: filter_values) {
-                Option<NUM_COMPARATOR> op_comparator = filter::extract_num_comparator(filter_value);
-                if (!op_comparator.ok()) {
-                    return Option<bool>(400, "Error with filter field `" + _field.name + "`: " + op_comparator.error());
-                }
-                if (op_comparator.get() == RANGE_INCLUSIVE) {
-                    // split the value around range operator to extract bounds
-                    std::vector<std::string> range_values;
-                    StringUtils::split(filter_value, range_values, filter::RANGE_OPERATOR());
-                    for (const std::string& range_value: range_values) {
-                        auto validate_op = filter::validate_numerical_filter_value(_field, range_value);
-                        if (!validate_op.ok()) {
-                            return validate_op;
-                        }
-                        filter_exp.values.push_back(range_value);
-                        filter_exp.comparators.push_back(op_comparator.get());
-                    }
-                } else {
-                    auto validate_op = filter::validate_numerical_filter_value(_field, filter_value);
-                    if (!validate_op.ok()) {
-                        return validate_op;
-                    }
-                    filter_exp.values.push_back(filter_value);
-                    filter_exp.comparators.push_back(op_comparator.get());
-                }
-            }
-        } else {
-            Option<NUM_COMPARATOR> op_comparator = filter::extract_num_comparator(raw_value);
-            if (!op_comparator.ok()) {
-                return Option<bool>(400, "Error with filter field `" + _field.name + "`: " + op_comparator.error());
-            }
-            if (op_comparator.get() == RANGE_INCLUSIVE) {
-                // split the value around range operator to extract bounds
-                std::vector<std::string> range_values;
-                StringUtils::split(raw_value, range_values, filter::RANGE_OPERATOR());
-                filter_exp.field_name = field_name;
-                for (const std::string& range_value: range_values) {
-                    auto validate_op = filter::validate_numerical_filter_value(_field, range_value);
-                    if (!validate_op.ok()) {
-                        return validate_op;
-                    }
-                    filter_exp.values.push_back(range_value);
-                    filter_exp.comparators.push_back(op_comparator.get());
-                }
-            } else {
-                auto validate_op = filter::validate_numerical_filter_value(_field, raw_value);
-                if (!validate_op.ok()) {
-                    return validate_op;
-                }
-                filter_exp = {field_name, {raw_value}, {op_comparator.get()}};
-            }
-        }
-    } else if (_field.is_bool()) {
-        NUM_COMPARATOR bool_comparator = EQUALS;
-        size_t filter_value_index = 0;
-        if (raw_value[0] == '=') {
-            bool_comparator = EQUALS;
-            while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
-        } else if (raw_value.size() >= 2 && raw_value[0] == '!' && raw_value[1] == '=') {
-            bool_comparator = NOT_EQUALS;
-            filter_value_index++;
-            while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
-        }
-        if (filter_value_index != 0) {
-            raw_value = raw_value.substr(filter_value_index);
-        }
-        if (filter_value_index == raw_value.size()) {
-            return Option<bool>(400, "Error with filter field `" + _field.name +
-                                     "`: Filter value cannot be empty.");
-        }
-        if (raw_value[0] == '[' && raw_value[raw_value.size() - 1] == ']') {
-            std::vector<std::string> filter_values;
-            StringUtils::split(raw_value.substr(1, raw_value.size() - 2), filter_values, ",");
-            filter_exp = {field_name, {}, {}};
-            for (std::string& filter_value: filter_values) {
-                if (filter_value != "true" && filter_value != "false") {
-                    return Option<bool>(400, "Values of filter field `" + _field.name +
-                                             "`: must be `true` or `false`.");
-                }
-                filter_value = (filter_value == "true") ? "1" : "0";
-                filter_exp.values.push_back(filter_value);
-                filter_exp.comparators.push_back(bool_comparator);
-            }
-        } else {
-            if (raw_value != "true" && raw_value != "false") {
-                return Option<bool>(400, "Value of filter field `" + _field.name + "` must be `true` or `false`.");
-            }
-            std::string bool_value = (raw_value == "true") ? "1" : "0";
-            filter_exp = {field_name, {bool_value}, {bool_comparator}};
-        }
-    } else if (_field.is_geopoint()) {
-        filter_exp = {field_name, {}, {}};
-        const std::string& format_err_msg = "Value of filter field `" + _field.name +
-                                            "`: must be in the `(-44.50, 170.29, 0.75 km)` or "
-                                            "(56.33, -65.97, 23.82, -127.82) format.";
-        NUM_COMPARATOR num_comparator;
-        // could be a single value or a list
-        if (raw_value[0] == '[' && raw_value[raw_value.size() - 1] == ']') {
-            std::vector<std::string> filter_values;
-            StringUtils::split(raw_value.substr(1, raw_value.size() - 2), filter_values, "),");
-            for (std::string& filter_value: filter_values) {
-                filter_value += ")";
-                std::string processed_filter_val;
-                auto parse_op = filter::parse_geopoint_filter_value(filter_value, format_err_msg, processed_filter_val,
-                                                                    num_comparator);
-                if (!parse_op.ok()) {
-                    return parse_op;
-                }
-                filter_exp.values.push_back(processed_filter_val);
-                filter_exp.comparators.push_back(num_comparator);
-            }
-        } else {
-            // single value, e.g. (10.45, 34.56, 2 km)
-            std::string processed_filter_val;
-            auto parse_op = filter::parse_geopoint_filter_value(raw_value, format_err_msg, processed_filter_val,
-                                                                num_comparator);
-            if (!parse_op.ok()) {
-                return parse_op;
-            }
-            filter_exp.values.push_back(processed_filter_val);
-            filter_exp.comparators.push_back(num_comparator);
-        }
-    } else if (_field.is_string()) {
-        size_t filter_value_index = 0;
-        NUM_COMPARATOR str_comparator = CONTAINS;
-        if (raw_value[0] == '=') {
-            // string filter should be evaluated in strict "equals" mode
-            str_comparator = EQUALS;
-            while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
-        } else if (raw_value.size() >= 2 && raw_value[0] == '!' && raw_value[1] == '=') {
-            str_comparator = NOT_EQUALS;
-            filter_value_index++;
-            while (++filter_value_index < raw_value.size() && raw_value[filter_value_index] == ' ');
-        }
-        if (filter_value_index == raw_value.size()) {
-            return Option<bool>(400, "Error with filter field `" + _field.name +
-                                     "`: Filter value cannot be empty.");
-        }
-        if (raw_value[filter_value_index] == '[' && raw_value[raw_value.size() - 1] == ']') {
-            std::vector<std::string> filter_values;
-            StringUtils::split_to_values(
-                    raw_value.substr(filter_value_index + 1, raw_value.size() - filter_value_index - 2), filter_values);
-            filter_exp = {field_name, filter_values, {str_comparator}};
-        } else {
-            filter_exp = {field_name, {raw_value.substr(filter_value_index)}, {str_comparator}};
-        }
-    } else {
-        return Option<bool>(400, "Error with filter field `" + _field.name +
-                                 "`: Unidentified field data type, see docs for supported data types.");
-    }
-
-    return Option<bool>(true);
-}
-
-// https://stackoverflow.com/a/423914/11218270
-Option<bool> toParseTree(std::queue<std::string>& postfix, filter_node_t*& root,
-                         const tsl::htrie_map<char, field>& search_schema,
-                         const Store* store,
-                         const std::string& doc_id_prefix) {
-    std::stack<filter_node_t*> nodeStack;
-
-    while (!postfix.empty()) {
-        const std::string expression = postfix.front();
-        postfix.pop();
-
-        filter_node_t* filter_node;
-        if (isOperator(expression)) {
-            auto message = "Could not parse the filter query: unbalanced `" + expression + "` operands.";
-
-            if (nodeStack.empty()) {
-                return Option<bool>(400, message);
-            }
-            auto operandB = nodeStack.top();
-            nodeStack.pop();
-
-            if (nodeStack.empty()) {
-                return Option<bool>(400, message);
-            }
-            auto operandA = nodeStack.top();
-            nodeStack.pop();
-
-            filter_node = new filter_node_t(expression == "&&" ? AND : OR, operandA, operandB);
-        } else {
-            filter filter_exp;
-            Option<bool> toFilter_op = toFilter(expression, filter_exp, search_schema, store, doc_id_prefix);
-            if (!toFilter_op.ok()) {
-                return toFilter_op;
-            }
-
-            filter_node = new filter_node_t(filter_exp);
-        }
-
-        nodeStack.push(filter_node);
-    }
-
-    if (nodeStack.empty()) {
-        return Option<bool>(400, "Filter query cannot be empty.");
-    }
-
-    root = nodeStack.top();
-    return Option<bool>(true);
-}
-
-Option<bool> filter::parse_filter_query(const std::string& filter_query,
-                                        const tsl::htrie_map<char, field>& search_schema,
-                                        const Store* store,
-                                        const std::string& doc_id_prefix,
-                                        filter_node_t*& root) {
-    auto _filter_query = filter_query;
-    StringUtils::trim(_filter_query);
-    if (_filter_query.empty()) {
-        return Option<bool>(true);
-    }
-
-    std::queue<std::string> tokens;
-    Option<bool> tokenize_op = StringUtils::tokenize_filter_query(filter_query, tokens);
-    if (!tokenize_op.ok()) {
-        return tokenize_op;
-    }
-
-    if (tokens.size() > 100) {
-        return Option<bool>(400, "Filter expression is not valid.");
-    }
-
-    std::queue<std::string> postfix;
-    Option<bool> toPostfix_op = toPostfix(tokens, postfix);
-    if (!toPostfix_op.ok()) {
-        return toPostfix_op;
-    }
-
-    Option<bool> toParseTree_op = toParseTree(postfix, root, search_schema, store, doc_id_prefix);
-    if (!toParseTree_op.ok()) {
-        return toParseTree_op;
-    }
-
-    return Option<bool>(true);
-}
 
 Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::json& field_json,
                                         std::vector<field>& the_fields,
@@ -462,6 +24,11 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
 
         return Option<bool>(400, "Wrong format for `fields`. It should be an array of objects containing "
                                  "`name`, `type`, `optional` and `facet` properties.");
+    }
+
+    if(field_json.count("store") != 0 && !field_json.at("store").is_boolean()) {
+        return Option<bool>(400, std::string("The `store` property of the field `") +
+                                 field_json[fields::name].get<std::string>() + std::string("` should be a boolean."));
     }
 
     if(field_json.count("drop") != 0) {
@@ -508,6 +75,67 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         }
     }
 
+    if (field_json.count(fields::reference) != 0 && !field_json.at(fields::reference).is_string()) {
+        return Option<bool>(400, "Reference should be a string.");
+    } else if (field_json.count(fields::reference) == 0) {
+        field_json[fields::reference] = "";
+    }
+
+    if (field_json.count(fields::async_reference) == 0) {
+        field_json[fields::async_reference] = false;
+    } else if (!field_json.at(fields::async_reference).is_boolean()) {
+        return Option<bool>(400, std::string("The `async_reference` property of the field `") +
+                                 field_json[fields::name].get<std::string>() + std::string("` should be a boolean."));
+    } else if (field_json[fields::async_reference].get<bool>() &&
+                field_json[fields::reference].get<std::string>().empty()) {
+        return Option<bool>(400, std::string("The `async_reference` property of the field `") +
+                                 field_json[fields::name].get<std::string>() + std::string("` is only applicable if "
+                                                                                           "`reference` is specified."));
+    }
+
+    if(field_json.count(fields::stem) != 0) {
+        if(!field_json.at(fields::stem).is_boolean()) {
+            return Option<bool>(400, std::string("The `stem` property of the field `") +
+                                     field_json[fields::name].get<std::string>() + std::string("` should be a boolean."));
+        }
+
+        if(field_json[fields::stem] && field_json[fields::type] != field_types::STRING && field_json[fields::type] != field_types::STRING_ARRAY) {
+            return Option<bool>(400, std::string("The `stem` property is only allowed for string and string[] fields."));
+        }
+
+        if(field_json[fields::stem].get<bool>()) {
+            std::string locale;
+            if(field_json.count(fields::locale) != 0) {
+                locale = field_json[fields::locale].get<std::string>();
+            }
+            auto stem_validation = StemmerManager::get_instance().validate_language(locale);
+            if(!stem_validation) {
+                return Option<bool>(400, std::string("The `locale` value of the field `") +
+                                         field_json[fields::name].get<std::string>() + std::string("` is not supported for stem."));
+            }
+        }
+    } else {
+        field_json[fields::stem] = false;
+    }
+
+    if (field_json.count(fields::range_index) != 0) {
+        if (!field_json.at(fields::range_index).is_boolean()) {
+            return Option<bool>(400, std::string("The `range_index` property of the field `") +
+                                     field_json[fields::name].get<std::string>() +
+                                     std::string("` should be a boolean."));
+        }
+
+        auto const& type = field_json["type"];
+        if (field_json[fields::range_index] &&
+            type != field_types::INT32 && type != field_types::INT32_ARRAY &&
+            type != field_types::INT64 && type != field_types::INT64_ARRAY &&
+            type != field_types::FLOAT && type != field_types::FLOAT_ARRAY) {
+            return Option<bool>(400, std::string("The `range_index` property is only allowed for the numerical fields`"));
+        }
+    } else {
+        field_json[fields::range_index] = false;
+    }
+
     if(field_json["name"] == ".*") {
         if(field_json.count(fields::facet) == 0) {
             field_json[fields::facet] = false;
@@ -545,6 +173,10 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
             return Option<bool>(400, "Field `.*` must be an index field.");
         }
 
+        if (!field_json[fields::reference].get<std::string>().empty()) {
+            return Option<bool>(400, "Field `.*` cannot be a reference field.");
+        }
+
         field fallback_field(field_json["name"], field_json["type"], field_json["facet"],
                              field_json["optional"], field_json[fields::index], field_json[fields::locale],
                              field_json[fields::sort], field_json[fields::infix]);
@@ -572,11 +204,15 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         field_json[fields::locale] = "";
     }
 
+    if(field_json.count(fields::store) == 0) {
+        field_json[fields::store] = true;
+    }
+
     if(field_json.count(fields::sort) == 0) {
         if(field_json["type"] == field_types::INT32 || field_json["type"] == field_types::INT64 ||
            field_json["type"] == field_types::FLOAT || field_json["type"] == field_types::BOOL ||
            field_json["type"] == field_types::GEOPOINT || field_json["type"] == field_types::GEOPOINT_ARRAY) {
-            if(field_json.count(fields::num_dim) == 0) {
+            if((field_json.count(fields::num_dim) == 0) || (field_json[fields::facet])) {
                 field_json[fields::sort] = true;
             } else {
                 field_json[fields::sort] = false;
@@ -584,6 +220,11 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         } else {
             field_json[fields::sort] = false;
         }
+    } else if (!field_json[fields::sort].get<bool>() &&
+                (field_json["type"] == field_types::GEOPOINT || field_json["type"] == field_types::GEOPOINT_ARRAY)) {
+        return Option<bool>(400, std::string("The `sort` property of the field `") +=
+                                 field_json[fields::name].get<std::string>() += "` having `" + field_json["type"].get<std::string>() +=
+                                 "` type cannot be `false`. The sort index is used during GeoSearch.");
     }
 
     if(field_json.count(fields::infix) == 0) {
@@ -594,6 +235,62 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         if(!enable_nested_fields) {
             return Option<bool>(400, "Type `object` or `object[]` can be used only when nested fields are enabled by "
                                      "setting` enable_nested_fields` to true.");
+        }
+    }
+
+    if(field_json.count(fields::embed) != 0) {
+        if(!field_json[fields::embed].is_object()) {
+            return Option<bool>(400, "Property `" + fields::embed + "` must be an object.");
+        }
+
+        auto& embed_json = field_json[fields::embed];
+
+        if(field_json[fields::embed].count(fields::from) == 0) {
+            return Option<bool>(400, "Property `" + fields::embed + "` must contain a `" + fields::from + "` property.");
+        }
+
+        if(!field_json[fields::embed][fields::from].is_array()) {
+            return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` must be an array.");
+        }
+
+        if(field_json[fields::embed][fields::from].empty()) {
+            return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` must have at least one element.");
+        }
+
+        if(embed_json.count(fields::model_config) == 0) {
+            return Option<bool>(400, "Property `" + fields::embed + "." + fields::model_config + "` not found.");
+        }
+
+        auto& model_config = embed_json[fields::model_config];
+
+        if(model_config.count(fields::model_name) == 0) {
+            return Option<bool>(400, "Property `" + fields::embed + "." + fields::model_config + "." + fields::model_name + "`not found");
+        }
+
+        if(!model_config[fields::model_name].is_string()) {
+            return Option<bool>(400, "Property `" + fields::embed + "."  + fields::model_config + "." + fields::model_name + "` must be a string.");
+        }
+
+        if(model_config[fields::model_name].get<std::string>().empty()) {
+            return Option<bool>(400, "Property `" + fields::embed + "." + fields::model_config + "." + fields::model_name + "` cannot be empty.");
+        }
+
+        if(model_config.count(fields::indexing_prefix) != 0) {
+            if(!model_config[fields::indexing_prefix].is_string()) {
+                return Option<bool>(400, "Property `" + fields::embed + "." + fields::model_config + "." + fields::indexing_prefix + "` must be a string.");
+            }
+        }
+
+        if(model_config.count(fields::query_prefix) != 0) {
+            if(!model_config[fields::query_prefix].is_string()) {
+                return Option<bool>(400, "Property `" + fields::embed + "." + fields::model_config + "." + fields::query_prefix + "` must be a string.");
+            }
+        }
+
+        for(auto& embed_from_field : field_json[fields::embed][fields::from]) {
+            if(!embed_from_field.is_string()) {
+                return Option<bool>(400, "Property `" + fields::embed + "." + fields::from + "` must contain only field names as strings.");
+            }
         }
     }
 
@@ -633,6 +330,47 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
         }
     }
 
+    if(field_json.count(fields::hnsw_params) != 0) {
+        if(!field_json[fields::hnsw_params].is_object()) {
+            return Option<bool>(400, "Property `" + fields::hnsw_params + "` must be an object.");
+        }
+
+        if(field_json[fields::hnsw_params].count("ef_construction") != 0 &&
+           (!field_json[fields::hnsw_params]["ef_construction"].is_number_unsigned() ||
+            field_json[fields::hnsw_params]["ef_construction"] == 0)) {
+            return Option<bool>(400, "Property `" + fields::hnsw_params + ".ef_construction` must be a positive integer.");
+        }
+
+        if(field_json[fields::hnsw_params].count("M") != 0 &&
+           (!field_json[fields::hnsw_params]["M"].is_number_unsigned() ||
+            field_json[fields::hnsw_params]["M"] == 0)) {
+            return Option<bool>(400, "Property `" + fields::hnsw_params + ".M` must be a positive integer.");
+        }
+
+        // remove unrelated properties except for m ef_construction and M
+        auto it = field_json[fields::hnsw_params].begin();
+        while(it != field_json[fields::hnsw_params].end()) {
+            if(it.key() != "max_elements" && it.key() != "ef_construction" && it.key() != "M" && it.key() != "ef") {
+                it = field_json[fields::hnsw_params].erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if(field_json[fields::hnsw_params].count("ef_construction") == 0) {
+            field_json[fields::hnsw_params]["ef_construction"] = 200;
+        }
+
+        if(field_json[fields::hnsw_params].count("M") == 0) {
+            field_json[fields::hnsw_params]["M"] = 16;
+        }
+    } else {
+        field_json[fields::hnsw_params] = R"({
+                                            "M": 16,
+                                            "ef_construction": 200
+                                        })"_json;
+    }
+
     if(field_json.count(fields::optional) == 0) {
         // dynamic type fields are always optional
         bool is_dynamic = field::is_dynamic(field_json[fields::name], field_json[fields::type]);
@@ -641,6 +379,10 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
 
     bool is_obj = field_json[fields::type] == field_types::OBJECT || field_json[fields::type] == field_types::OBJECT_ARRAY;
     bool is_regexp_name = field_json[fields::name].get<std::string>().find(".*") != std::string::npos;
+
+    if (is_regexp_name && !field_json[fields::reference].get<std::string>().empty()) {
+        return Option<bool>(400, "Wildcard field cannot have a reference.");
+    }
 
     if(is_obj || (!is_regexp_name && enable_nested_fields &&
                    field_json[fields::name].get<std::string>().find('.') != std::string::npos)) {
@@ -658,31 +400,115 @@ Option<bool> field::json_field_to_field(bool enable_nested_fields, nlohmann::jso
 
     auto vec_dist = magic_enum::enum_cast<vector_distance_type_t>(field_json[fields::vec_dist].get<std::string>()).value();
 
+    if (!field_json[fields::reference].get<std::string>().empty()) {
+        std::vector<std::string> tokens;
+        StringUtils::split(field_json[fields::reference].get<std::string>(), tokens, ".");
+
+        if (tokens.size() < 2) {
+            return Option<bool>(400, "Invalid reference `" + field_json[fields::reference].get<std::string>()  + "`.");
+        }
+
+        tokens.clear();
+        StringUtils::split(field_json[fields::name].get<std::string>(), tokens, ".");
+
+        if (tokens.size() > 2) {
+            return Option<bool>(400, "`" + field_json[fields::name].get<std::string>() + "` field cannot have a reference."
+                                        " Only the top-level field of an object is allowed.");
+        }
+    }
+
     the_fields.emplace_back(
             field(field_json[fields::name], field_json[fields::type], field_json[fields::facet],
                   field_json[fields::optional], field_json[fields::index], field_json[fields::locale],
                   field_json[fields::sort], field_json[fields::infix], field_json[fields::nested],
-                  field_json[fields::nested_array], field_json[fields::num_dim], vec_dist)
+                  field_json[fields::nested_array], field_json[fields::num_dim], vec_dist,
+                  field_json[fields::reference], field_json[fields::embed], field_json[fields::range_index], 
+                  field_json[fields::store], field_json[fields::stem], field_json[fields::hnsw_params],
+                  field_json[fields::async_reference])
     );
+
+    if (!field_json[fields::reference].get<std::string>().empty()) {
+        // Add a reference helper field in the schema. It stores the doc id of the document it references to reduce the
+        // computation while searching.
+        auto f = field(field_json[fields::name].get<std::string>() + fields::REFERENCE_HELPER_FIELD_SUFFIX,
+                       field_types::is_array(field_json[fields::type].get<std::string>()) ? field_types::INT64_ARRAY : field_types::INT64,
+                       false, field_json[fields::optional], true);
+        f.nested = field_json[fields::nested];
+        the_fields.emplace_back(std::move(f));
+    }
 
     return Option<bool>(true);
 }
 
 bool field::flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_array, bool has_obj_array,
-                        const field& the_field, const std::string& flat_name,
+                        bool is_update, const field& the_field, const std::string& flat_name,
+                        const std::unordered_map<std::string, field>& dyn_fields,
                         std::unordered_map<std::string, field>& flattened_fields) {
     if(value.is_object()) {
         has_obj_array = has_array;
-        for(const auto& kv: value.items()) {
-            flatten_obj(doc, kv.value(), has_array, has_obj_array, the_field, flat_name + "." + kv.key(), flattened_fields);
+        auto it = value.begin();
+        while(it != value.end()) {
+            const std::string& child_field_name = flat_name + "." + it.key();
+            if(it.value().is_null()) {
+                if(!has_array) {
+                    // we don't want to push null values into an array because that's not valid
+                    doc[child_field_name] = nullptr;
+                }
+
+                field flattened_field;
+                flattened_field.name = child_field_name;
+                flattened_field.type = field_types::NIL;
+                flattened_fields[child_field_name] = flattened_field;
+
+                if(!is_update) {
+                    // update code path requires and takes care of null values
+                    it = value.erase(it);
+                } else {
+                    it++;
+                }
+            } else {
+                flatten_obj(doc, it.value(), has_array, has_obj_array, is_update, the_field, child_field_name,
+                            dyn_fields, flattened_fields);
+                it++;
+            }
         }
     } else if(value.is_array()) {
         for(const auto& kv: value.items()) {
-            flatten_obj(doc, kv.value(), true, has_obj_array, the_field, flat_name, flattened_fields);
+            flatten_obj(doc, kv.value(), true, has_obj_array, is_update, the_field, flat_name, dyn_fields, flattened_fields);
         }
     } else { // must be a primitive
         if(doc.count(flat_name) != 0 && flattened_fields.find(flat_name) == flattened_fields.end()) {
             return true;
+        }
+
+        std::string detected_type;
+        bool found_dynamic_field = false;
+        field dyn_field(the_field.name, field_types::STRING, false);
+
+        for(auto dyn_field_it = dyn_fields.begin(); dyn_field_it != dyn_fields.end(); dyn_field_it++) {
+            auto& dynamic_field = dyn_field_it->second;
+
+            if(dynamic_field.is_auto() || dynamic_field.is_string_star()) {
+                continue;
+            }
+
+            if(std::regex_match(flat_name, std::regex(dynamic_field.name))) {
+                detected_type = dynamic_field.type;
+                found_dynamic_field = true;
+                dyn_field = dynamic_field;
+                break;
+            }
+        }
+
+        if(!found_dynamic_field) {
+            if(!field::get_type(value, detected_type)) {
+                return false;
+            }
+
+            if(std::isalnum(detected_type.back()) && has_array) {
+                // convert singular type to multi valued type
+                detected_type += "[]";
+            }
         }
 
         if(has_array) {
@@ -691,23 +517,15 @@ bool field::flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_arr
             doc[flat_name] = value;
         }
 
-        std::string detected_type;
-        if(!field::get_type(value, detected_type)) {
-            return false;
-        }
-
-        if(std::isalnum(detected_type.back()) && has_array) {
-            // convert singular type to multi valued type
-            detected_type += "[]";
-        }
-
-        field flattened_field = the_field;
+        field flattened_field = found_dynamic_field ? dyn_field : the_field;
         flattened_field.name = flat_name;
         flattened_field.type = detected_type;
         flattened_field.optional = true;
         flattened_field.nested = true;
         flattened_field.nested_array = has_obj_array;
-        flattened_field.set_computed_defaults(-1, -1);
+        int sort_op = flattened_field.sort ? 1 : -1;
+        int infix_op = flattened_field.infix ? 1 : -1;
+        flattened_field.set_computed_defaults(sort_op, infix_op);
         flattened_fields[flat_name] = flattened_field;
     }
 
@@ -716,31 +534,67 @@ bool field::flatten_obj(nlohmann::json& doc, nlohmann::json& value, bool has_arr
 
 Option<bool> field::flatten_field(nlohmann::json& doc, nlohmann::json& obj, const field& the_field,
                                   std::vector<std::string>& path_parts, size_t path_index,
-                                  bool has_array, bool has_obj_array, std::unordered_map<std::string, field>& flattened_fields) {
+                                  bool has_array, bool has_obj_array, bool is_update,
+                                  const std::unordered_map<std::string, field>& dyn_fields,
+                                  std::unordered_map<std::string, field>& flattened_fields) {
     if(path_index == path_parts.size()) {
         // end of path: check if obj matches expected type
         std::string detected_type;
-        if(!field::get_type(obj, detected_type)) {
-            return Option<bool>(400, "Field `" + the_field.name + "` has an incorrect type.");
+        bool found_dynamic_field = false;
+
+        for(auto dyn_field_it = dyn_fields.begin(); dyn_field_it != dyn_fields.end(); dyn_field_it++) {
+            auto& dynamic_field = dyn_field_it->second;
+
+            if(dynamic_field.is_auto() || dynamic_field.is_string_star()) {
+                continue;
+            }
+
+            if(std::regex_match(the_field.name, std::regex(dynamic_field.name))) {
+                detected_type = obj.is_object() ? field_types::OBJECT : dynamic_field.type;
+                found_dynamic_field = true;
+                break;
+            }
         }
 
-        if(std::isalnum(detected_type.back()) && has_array) {
-            // convert singular type to multi valued type
-            detected_type += "[]";
+        if(!found_dynamic_field) {
+            if(!field::get_type(obj, detected_type)) {
+                if(obj.is_null() && the_field.optional) {
+                    // null values are allowed only if field is optional
+                    return Option<bool>(true);
+                }
+
+                return Option<bool>(400, "Field `" + the_field.name + "` has an incorrect type.");
+            }
+
+            if(std::isalnum(detected_type.back()) && has_array) {
+                // convert singular type to multi valued type
+                detected_type += "[]";
+            }
         }
 
         has_obj_array = has_obj_array || ((detected_type == field_types::OBJECT) && has_array);
 
         // handle differences in detection of numerical types
         bool is_numericaly_valid = (detected_type != the_field.type) &&
-                                   ((detected_type == field_types::INT64 &&
-                                     (the_field.type == field_types::INT32 || the_field.type == field_types::FLOAT)) ||
-                                    (detected_type == field_types::INT64_ARRAY &&
-                                     (the_field.type == field_types::INT32_ARRAY || the_field.type == field_types::FLOAT_ARRAY)));
+            ( (detected_type == field_types::INT64 &&
+                (the_field.type == field_types::INT32 || the_field.type == field_types::FLOAT)) ||
+
+              (detected_type == field_types::INT64_ARRAY &&
+                (the_field.type == field_types::INT32_ARRAY || the_field.type == field_types::FLOAT_ARRAY)) ||
+
+              (detected_type == field_types::FLOAT_ARRAY && the_field.type == field_types::GEOPOINT_ARRAY) ||
+
+              (detected_type == field_types::FLOAT_ARRAY && the_field.type == field_types::GEOPOINT && !has_obj_array) ||
+
+              (detected_type == field_types::INT64_ARRAY && the_field.type == field_types::GEOPOINT && !has_obj_array) ||
+
+              (detected_type == field_types::INT64_ARRAY && the_field.type == field_types::GEOPOINT_ARRAY)
+           );
 
         if(detected_type == the_field.type || is_numericaly_valid) {
             if(the_field.is_object()) {
-                flatten_obj(doc, obj, has_array, has_obj_array, the_field, the_field.name, flattened_fields);
+                flatten_obj(doc, obj, has_array, has_obj_array, is_update, the_field, the_field.name,
+                            dyn_fields, flattened_fields);
             } else {
                 if(doc.count(the_field.name) != 0 && flattened_fields.find(the_field.name) == flattened_fields.end()) {
                     return Option<bool>(true);
@@ -783,27 +637,35 @@ Option<bool> field::flatten_field(nlohmann::json& doc, nlohmann::json& obj, cons
             for(auto& ele: it.value()) {
                 has_obj_array = has_obj_array || ele.is_object();
                 Option<bool> op = flatten_field(doc, ele, the_field, path_parts, path_index + 1, has_array,
-                                                has_obj_array, flattened_fields);
+                                                has_obj_array, is_update, dyn_fields, flattened_fields);
                 if(!op.ok()) {
                     return op;
                 }
             }
             return Option<bool>(true);
         } else {
-            return flatten_field(doc, it.value(), the_field, path_parts, path_index + 1, has_array, has_obj_array, flattened_fields);
+            return flatten_field(doc, it.value(), the_field, path_parts, path_index + 1, has_array, has_obj_array,
+                                 is_update, dyn_fields, flattened_fields);
         }
-    } {
+    } else if(!the_field.optional) {
         return Option<bool>(404, "Field `" + the_field.name + "` not found.");
     }
+
+    return Option<bool>(true);
 }
 
 Option<bool> field::flatten_doc(nlohmann::json& document,
                                 const tsl::htrie_map<char, field>& nested_fields,
-                                bool missing_is_ok, std::vector<field>& flattened_fields) {
+                                const std::unordered_map<std::string, field>& dyn_fields,
+                                bool is_update, std::vector<field>& flattened_fields) {
 
     std::unordered_map<std::string, field> flattened_fields_map;
 
     for(auto& nested_field: nested_fields) {
+        if(!nested_field.index) {
+            continue;
+        }
+
         std::vector<std::string> field_parts;
         StringUtils::split(nested_field.name, field_parts, ".");
 
@@ -812,12 +674,13 @@ Option<bool> field::flatten_doc(nlohmann::json& document,
             continue;
         }
 
-        auto op = flatten_field(document, document, nested_field, field_parts, 0, false, false, flattened_fields_map);
+        auto op = flatten_field(document, document, nested_field, field_parts, 0, false, false,
+                                is_update, dyn_fields, flattened_fields_map);
         if(op.ok()) {
             continue;
         }
 
-        if(op.code() == 404 && (missing_is_ok || nested_field.optional)) {
+        if(op.code() == 404 && (is_update || nested_field.optional)) {
             continue;
         } else {
             return op;
@@ -827,7 +690,10 @@ Option<bool> field::flatten_doc(nlohmann::json& document,
     document[".flat"] = nlohmann::json::array();
     for(auto& kv: flattened_fields_map) {
         document[".flat"].push_back(kv.second.name);
-        flattened_fields.push_back(kv.second);
+        if(kv.second.type != field_types::NIL) {
+            // not a real field so we won't add it
+            flattened_fields.push_back(kv.second);
+        }
     }
 
     return Option<bool>(true);
@@ -842,4 +708,201 @@ void field::compact_nested_fields(tsl::htrie_map<char, field>& nested_fields) {
     for(auto& field_name: nested_fields_vec) {
         nested_fields.erase_prefix(field_name + ".");
     }
+}
+
+Option<bool> field::json_fields_to_fields(bool enable_nested_fields, nlohmann::json &fields_json, string &fallback_field_type,
+                                          std::vector<field>& the_fields) {
+    size_t num_auto_detect_fields = 0;
+    const tsl::htrie_map<char, field> dummy_search_schema;
+
+    for(size_t i = 0; i < fields_json.size(); i++) {
+        nlohmann::json& field_json = fields_json[i];
+        auto op = json_field_to_field(enable_nested_fields,
+                                      field_json, the_fields, fallback_field_type, num_auto_detect_fields);
+        if(!op.ok()) {
+            return op;
+        }
+
+        if(!the_fields.empty() && !the_fields.back().embed.empty()) {
+            auto validate_res = validate_and_init_embed_field(dummy_search_schema, field_json, fields_json, the_fields.back());
+            if(!validate_res.ok()) {
+                return validate_res;
+            }
+        }
+    }
+
+    if(num_auto_detect_fields > 1) {
+        return Option<bool>(400,"There can be only one field named `.*`.");
+    }
+
+    return Option<bool>(true);
+}
+
+Option<bool> field::validate_and_init_embed_field(const tsl::htrie_map<char, field>& search_schema, nlohmann::json& field_json,
+                                                  const nlohmann::json& fields_json,
+                                                  field& the_field) {
+    const std::string err_msg = "Property `" + fields::embed + "." + fields::from +
+                                    "` can only refer to string, string array or image (for supported models) fields.";
+
+    bool found_image_field = false;
+    for(auto& field_name : field_json[fields::embed][fields::from].get<std::vector<std::string>>()) {
+
+        auto embed_field = std::find_if(fields_json.begin(), fields_json.end(), [&field_name](const nlohmann::json& x) {
+            return x["name"].get<std::string>() == field_name;
+        });
+
+
+        if(embed_field == fields_json.end()) {
+            const auto& embed_field2 = search_schema.find(field_name);
+            if (embed_field2 == search_schema.end()) {
+                return Option<bool>(400, err_msg);
+            } else if (embed_field2->type != field_types::STRING && embed_field2->type != field_types::STRING_ARRAY && embed_field2->type != field_types::IMAGE) {
+                return Option<bool>(400, err_msg);
+            }
+        } else if((*embed_field)[fields::type] != field_types::STRING &&
+                  (*embed_field)[fields::type] != field_types::STRING_ARRAY &&
+                    (*embed_field)[fields::type] != field_types::IMAGE) {
+            return Option<bool>(400, err_msg);
+        }
+    }
+
+    const auto& model_config = field_json[fields::embed][fields::model_config];
+    size_t num_dim = field_json[fields::num_dim].get<size_t>();
+    auto res = EmbedderManager::get_instance().validate_and_init_model(model_config, num_dim);
+    if(!res.ok()) {
+        return Option<bool>(res.code(), res.error());
+    }
+    
+    LOG(INFO) << "Model init done.";
+    field_json[fields::num_dim] = num_dim;
+    the_field.num_dim = num_dim;
+
+    return Option<bool>(true);
+}
+
+Option<bool> field::fields_to_json_fields(const std::vector<field>& fields, const string& default_sorting_field,
+                                          nlohmann::json& fields_json) {
+    bool found_default_sorting_field = false;
+
+    // Check for duplicates in field names
+    std::map<std::string, std::vector<const field*>> unique_fields;
+
+    for(const field & field: fields) {
+        unique_fields[field.name].push_back(&field);
+
+        if(field.name == "id") {
+            continue;
+        }
+
+        nlohmann::json field_val;
+        field_val[fields::name] = field.name;
+        field_val[fields::type] = field.type;
+        field_val[fields::facet] = field.facet;
+        field_val[fields::optional] = field.optional;
+        field_val[fields::index] = field.index;
+        field_val[fields::sort] = field.sort;
+        field_val[fields::infix] = field.infix;
+
+        field_val[fields::locale] = field.locale;
+
+        field_val[fields::store] = field.store;
+        field_val[fields::stem] = field.stem;
+        field_val[fields::range_index] = field.range_index;
+
+        if(field.embed.count(fields::from) != 0) {
+            field_val[fields::embed] = field.embed;
+        }
+
+        field_val[fields::nested] = field.nested;
+        if(field.nested) {
+            field_val[fields::nested_array] = field.nested_array;
+        }
+
+        if(field.num_dim > 0) {
+            field_val[fields::num_dim] = field.num_dim;
+            field_val[fields::vec_dist] = field.vec_dist == ip ? "ip" : "cosine";
+        }
+
+        if (!field.reference.empty()) {
+            field_val[fields::reference] = field.reference;
+            field_val[fields::async_reference] = field.is_async_reference;
+        }
+
+        fields_json.push_back(field_val);
+
+        if(!field.has_valid_type()) {
+            return Option<bool>(400, "Field `" + field.name +
+                                     "` has an invalid data type `" + field.type +
+                                     "`, see docs for supported data types.");
+        }
+
+        if(field.name == default_sorting_field && !field.is_sortable()) {
+            return Option<bool>(400, "Default sorting field `" + default_sorting_field +
+                                     "` is not a sortable type.");
+        }
+
+        if(field.name == default_sorting_field) {
+            if(field.optional) {
+                return Option<bool>(400, "Default sorting field `" + default_sorting_field +
+                                         "` cannot be an optional field.");
+            }
+
+            if(field.is_geopoint()) {
+                return Option<bool>(400, "Default sorting field cannot be of type geopoint.");
+            }
+
+            found_default_sorting_field = true;
+        }
+
+        if(field.is_dynamic() && !field.nested && !field.optional) {
+            return Option<bool>(400, "Field `" + field.name + "` must be an optional field.");
+        }
+
+        if(field.name == ".*" && !field.index) {
+            return Option<bool>(400, "Field `" + field.name + "` cannot be marked as non-indexable.");
+        }
+
+        if(!field.index && field.facet) {
+            return Option<bool>(400, "Field `" + field.name + "` cannot be a facet since "
+                                                              "it's marked as non-indexable.");
+        }
+
+        if(!field.is_sort_field() && field.sort) {
+            return Option<bool>(400, "Field `" + field.name + "` cannot be a sortable field.");
+        }
+    }
+
+    if(!default_sorting_field.empty() && !found_default_sorting_field) {
+        return Option<bool>(400, "Default sorting field is defined as `" + default_sorting_field +
+                                 "` but is not found in the schema.");
+    }
+
+    // check for duplicate field names in schema
+    for(auto& fname_fields: unique_fields) {
+        if(fname_fields.second.size() > 1) {
+            // if there are more than 1 field with the same field name, then
+            // a) only 1 field can be of static type
+            // b) only 1 field can be of dynamic type
+            size_t num_static = 0;
+            size_t num_dynamic = 0;
+
+            for(const field* f: fname_fields.second) {
+                if(f->name == ".*" || f->is_dynamic()) {
+                    num_dynamic++;
+                } else {
+                    num_static++;
+                }
+            }
+
+            if(num_static != 0 && num_static > 1) {
+                return Option<bool>(400, "There are duplicate field names in the schema.");
+            }
+
+            if(num_dynamic != 0 && num_dynamic > 1) {
+                return Option<bool>(400, "There are duplicate field names in the schema.");
+            }
+        }
+    }
+
+    return Option<bool>(true);
 }

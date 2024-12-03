@@ -11,6 +11,8 @@
 #include "raft_server.h"
 #include "logger.h"
 #include "ratelimit_manager.h"
+#include "sole.hpp"
+#include "core_api.h"
 
 HttpServer::HttpServer(const std::string & version, const std::string & listen_address,
                        uint32_t listen_port, const std::string & ssl_cert_path, const std::string & ssl_cert_key_path,
@@ -310,12 +312,7 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
     std::string metric_identifier = http_method + " " + path_without_query;
     AppMetrics::get_instance().increment_count(metric_identifier, 1);
 
-    std::string client_ip = "0.0.0.0";
-
-    if(Config::get_instance().get_enable_access_logging() ||
-       Config::get_instance().get_log_slow_requests_time_ms() >= 0) {
-        client_ip = http_req::get_ip_addr(req).ip;
-    }
+    std::string client_ip = http_req::get_ip_addr(req).ip;
 
     if(Config::get_instance().get_enable_access_logging()) {
         uint64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -407,6 +404,17 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
         api_auth_key_sent = query_map[http_req::AUTH_HEADER];
     }
 
+    // extract user id from header, if not already present as GET param
+    ssize_t user_header_cursor = h2o_find_header_by_str(&req->headers, http_req::USER_HEADER, strlen(http_req::USER_HEADER), -1);
+
+    if(user_header_cursor != -1) {
+        h2o_iovec_t & slot = req->headers.entries[user_header_cursor].value;
+        std::string user_id_sent = std::string(slot.base, slot.len);
+        query_map[http_req::USER_HEADER] = user_id_sent;
+    } else if(query_map.count(http_req::USER_HEADER) == 0) {
+        query_map[http_req::USER_HEADER] = client_ip;
+    }
+
     route_path *rpath = nullptr;
     uint64_t route_hash = h2o_handler->http_server->find_route(path_parts, http_method, &rpath);
 
@@ -420,7 +428,7 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
 
     bool needs_readiness_check = (root_resource == "collections") ||
          !(
-             root_resource == "health" || root_resource == "debug" ||
+             root_resource == "health" || root_resource == "debug" || root_resource == "proxy" ||
              root_resource == "stats.json" || root_resource == "metrics.json" ||
              root_resource == "sequence" || root_resource == "operations" ||
              root_resource == "config" || root_resource == "status"
@@ -429,7 +437,7 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
     bool use_meta_thread_pool = (root_resource == "status");
 
     if(needs_readiness_check) {
-        bool write_op = is_write_request(root_resource, http_method);
+        bool write_op = is_write_request(root_resource, http_method, rpath->handler);
         bool read_op = !write_op;
 
         std::string message = "{ \"message\": \"Not Ready or Lagging\"}";
@@ -452,17 +460,45 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
         }
     }
 
-    const std::string & body = std::string(req->entity.base, req->entity.len);
+    const std::string& body = std::string(req->entity.base, req->entity.len);
     std::vector<nlohmann::json> embedded_params_vec;
 
-
-    if(RateLimitManager::getInstance()->is_rate_limited({{RateLimitedEntityType::api_key, api_auth_key_sent}, {RateLimitedEntityType::ip, client_ip}})) {
+    if(RateLimitManager::getInstance()->is_rate_limited({RateLimitedEntityType::api_key, api_auth_key_sent}, {RateLimitedEntityType::ip, client_ip})) {
         std::string message = "{ \"message\": \"Rate limit exceeded or blocked\"}";
         return send_response(req, 429, message);
     }
 
+    bool is_multi_search_query = (root_resource == "multi_search");
 
-    if(root_resource != "multi_search") {
+    if(Config::get_instance().get_enable_search_logging()) {
+        std::string query_string = "?";
+        bool is_search_query = (is_multi_search_query ||
+                                StringUtils::ends_with(path_without_query, "/documents/search"));
+
+        if(is_search_query) {
+            std::string search_payload;
+
+            if(is_multi_search_query) {
+                search_payload = body;
+                StringUtils::erase_char(search_payload, '\n');
+            }
+
+            // ignore params map of multi_search since it is mutated for every search object in the POST body
+            for(const auto& kv: query_map) {
+                if(kv.first != http_req::AUTH_HEADER) {
+                    query_string += kv.first + "=" + kv.second + "&";
+                }
+            }
+
+            std::string full_url_path = metric_identifier + query_string;
+
+            // NOTE: we log the `body` ONLY for multi-search query
+            LOG(INFO) << "event=search_request" << ", client_ip=" << client_ip << ", endpoint=" << full_url_path
+                      << ", body=" << (is_multi_search_query ? search_payload : "");
+        }
+    }
+
+    if(!is_multi_search_query) {
         // multi_search needs to be handled later because the API key could be part of request body and
         // the whole request body might not be available right now.
         bool authenticated = h2o_handler->http_server->auth_handler(query_map, embedded_params_vec, body, *rpath,
@@ -493,7 +529,16 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
     );
     *allocated_generator = custom_gen;
 
+    // ensures that the first response need not wait for previous chunk to be done sending
+    response->notify();
+
     //LOG(INFO) << "Init res: " << custom_gen->response << ", ref count: " << custom_gen->response.use_count();
+
+    if(root_resource == "multi_search") {
+        // format is <length of api_auth_key_sent>:<api_auth_key_sent><client_ip>
+        std::string multi_search_key = std::to_string(api_auth_key_sent.length()) + ":" + api_auth_key_sent + client_ip;
+        request->metadata = multi_search_key;
+    }
 
     // routes match and is an authenticated request
     // do any additional pre-request middleware operations here
@@ -502,9 +547,23 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
         request->metadata = StringUtils::randstring(AuthManager::GENERATED_KEY_LEN);
     }
 
+    if(rpath->action == "conversations/models:create") {
+        try {
+            nlohmann::json body_json = nlohmann::json::parse(request->body);
+            if(body_json.count("id") != 0 && body_json["id"].is_string()) {
+               request->metadata = body_json["id"].get<std::string>();
+            } else {
+                request->metadata = sole::uuid4().str();
+            }
+        } catch (const nlohmann::json::parse_error& e) {
+            request->metadata = sole::uuid4().str();
+        }
+    }
+
     if(req->proceed_req == nullptr) {
         // Full request body is already available, so we don't care if handler is async or not
         //LOG(INFO) << "Full request body is already available: " << req->entity.len;
+
         request->last_chunk_aggregate = true;
         return process_request(request, response, rpath, h2o_handler, use_meta_thread_pool);
     } else {
@@ -515,19 +574,26 @@ int HttpServer::catch_all_handler(h2o_handler_t *_h2o_handler, h2o_req_t *req) {
 
         req->write_req.cb = async_req_cb;
         req->write_req.ctx = custom_gen;
-        req->proceed_req(req, req->entity.len, H2O_SEND_STATE_IN_PROGRESS);
+        req->proceed_req(req, NULL);
     }
 
     return 0;
 }
 
 
-bool HttpServer::is_write_request(const std::string& root_resource, const std::string& http_method) {
+bool HttpServer::is_write_request(const std::string& root_resource, const std::string& http_method,
+                                  bool (*rpath_handler)(const std::shared_ptr<http_req>&, const std::shared_ptr<http_res>&)) {
     if(http_method == "GET") {
         return false;
     }
 
-    bool write_free_request = (root_resource == "multi_search" || root_resource == "operations");
+    if(rpath_handler == post_create_event) {
+        return false;
+    }
+
+    bool write_free_request = (root_resource == "multi_search" || root_resource == "proxy" ||
+                               root_resource == "operations");
+
     if(!write_free_request &&
        (http_method == "POST" || http_method == "PUT" ||
         http_method == "DELETE" || http_method == "PATCH")) {
@@ -537,25 +603,30 @@ bool HttpServer::is_write_request(const std::string& root_resource, const std::s
     return false;
 }
 
-int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
-    // NOTE: this callback is triggered multiple times by HTTP 2 but only once by HTTP 1
-    // This quirk is because of the underlying buffer/window sizes. We will have to deal with both cases.
+int HttpServer::async_req_cb(void *ctx, int is_end_stream) {
     h2o_custom_generator_t* custom_generator = static_cast<h2o_custom_generator_t*>(ctx);
 
     const std::shared_ptr<http_req>& request = custom_generator->req();
     const std::shared_ptr<http_res>& response = custom_generator->res();
 
-    /*
-    LOG(INFO) << "async_req_cb, chunk.len=" << chunk.len
-              << ", request->req->entity.len=" << request->req->entity.len
-              << ", content_len: " << request->req->content_length
-              << ", is_end_stream=" << is_end_stream;
-    */
+    h2o_iovec_t chunk = request->_req->entity;
+    bool async_req = custom_generator->rpath->async_req;
+    bool is_http_v1 = (0x101 <= request->_req->version && request->_req->version < 0x200);
+
+    /*LOG(INFO) << "async_req_cb, chunk.len=" << chunk.len
+              << ", is_http_v1: " << is_http_v1
+              << ", request->req->entity.len=" << request->_req->entity.len
+              << ", content_len: " << request->_req->content_length
+              << ", is_end_stream=" << is_end_stream;*/
 
     // disallow specific curl clients from using import call via http2
     // detects: https://github.com/curl/curl/issues/1410
-    if(request->_req->version >= 0x200 && request->path_without_query.find("import") != std::string::npos) {
-        ssize_t agent_header_cursor = h2o_find_header_by_str(&request->_req->headers, http_req::AGENT_HEADER, strlen(http_req::AGENT_HEADER), -1);
+    if(!is_http_v1 && async_req && request->first_chunk_aggregate && request->chunk_len == 0 &&
+        request->path_without_query.find("import") != std::string::npos) {
+
+        ssize_t agent_header_cursor = h2o_find_header_by_str(&request->_req->headers,
+                                                             http_req::AGENT_HEADER,
+                                                             strlen(http_req::AGENT_HEADER), -1);
         if(agent_header_cursor != -1) {
             h2o_iovec_t & slot = request->_req->headers.entries[agent_header_cursor].value;
             const std::string user_agent = std::string(slot.base, slot.len);
@@ -567,7 +638,8 @@ int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
                     }
                 }
 
-                if(std::stoll(version_num) < 7710) { // allow >= v7.71.0
+                int major_version = version_num[0] - 48;  // convert ascii char to integer
+                if(major_version <= 7 && std::stoll(version_num) < 7710) { // allow >= v7.71.0
                     std::string message = "{ \"message\": \"HTTP2 is not supported by your curl client. "
                                           "You need to use atleast Curl v7.71.0.\"}";
                     h2o_iovec_t body = h2o_strdup(&request->_req->pool, message.c_str(), SIZE_MAX);
@@ -581,7 +653,6 @@ int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
     }
 
     std::string chunk_str(chunk.base, chunk.len);
-
     request->body += chunk_str;
     request->chunk_len += chunk.len;
 
@@ -593,25 +664,7 @@ int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
     //LOG(INFO) << "request->body.size(): " << request->body.size() << ", request->chunk_len=" << request->chunk_len;
     // LOG(INFO) << "req->entity.len: " << request->req->entity.len << ", request->chunk_len=" << request->chunk_len;
 
-    bool async_req = custom_generator->rpath->async_req;
-
-    /*
-        On HTTP2, the request body callback is invoked multiple times with chunks of 16,384 bytes until the
-        `active_stream_window_size` is reached. For the first iteration, `active_stream_window_size`
-        includes initial request entity size and as well as chunk sizes
-
-        On HTTP 1, though, the handler is called only once with a small chunk size and requires proceed_req() to
-        be called for fetching further chunks. We need to handle this difference.
-    */
-
-    bool exceeds_chunk_limit;
-
-    if(!request->is_http_v1 && request->first_chunk_aggregate) {
-        exceeds_chunk_limit = ((request->chunk_len + request->_req->entity.len) >= ACTIVE_STREAM_WINDOW_SIZE);
-    } else {
-        exceeds_chunk_limit = (request->chunk_len >= ACTIVE_STREAM_WINDOW_SIZE);
-    }
-
+    bool exceeds_chunk_limit = (request->chunk_len >= ACTIVE_STREAM_WINDOW_SIZE);
     bool can_process_async = async_req && exceeds_chunk_limit;
 
     /*if(is_end_stream == 1) {
@@ -622,7 +675,6 @@ int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
     if(can_process_async || is_end_stream) {
         // For async streaming requests, handler should be invoked for every aggregated chunk
         // For a non streaming request, buffer body and invoke only at the end
-
         if(request->first_chunk_aggregate) {
             request->first_chunk_aggregate = false;
         }
@@ -633,22 +685,7 @@ int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
         return 0;
     }
 
-    // we are not ready to fire the request handler, so that means we need to buffer the request further
-    // this could be because we are a) dealing with a HTTP v1 request or b) a synchronous request
-
-    if(request->is_http_v1) {
-        // http v1 callbacks fire on small chunk sizes, so fetch more to match window size of http v2 buffer
-        size_t written = chunk.len;
-        request->_req->proceed_req(request->_req, written, H2O_SEND_STATE_IN_PROGRESS);
-    }
-
-    if(!async_req) {
-        // progress ONLY non-streaming type request body since
-        // streaming requests will call proceed_req in an async fashion
-        size_t written = chunk.len;
-        request->_req->proceed_req(request->_req, written, H2O_SEND_STATE_IN_PROGRESS);
-    }
-
+    request->_req->proceed_req(request->_req, NULL);
     return 0;
 }
 
@@ -670,7 +707,7 @@ int HttpServer::process_request(const std::shared_ptr<http_req>& request, const 
         }
     }
 
-    bool is_write = is_write_request(root_resource, rpath->http_method);
+    bool is_write = is_write_request(root_resource, rpath->http_method, rpath->handler);
 
     if(is_write) {
         handler->http_server->get_replication_state()->write(request, response);
@@ -683,6 +720,7 @@ int HttpServer::process_request(const std::shared_ptr<http_req>& request, const 
                        handler->http_server->get_thread_pool();
 
     // LOG(INFO) << "Before enqueue res: " << response
+    thread_pool->log_exhaustion();
     thread_pool->enqueue([rpath, message_dispatcher, request, response]() {
         // call the API handler
         //LOG(INFO) << "Wait for response " << response.get() << ", action: " << rpath->_get_action();
@@ -811,6 +849,15 @@ void HttpServer::stream_response(stream_response_state_t& state) {
 
     h2o_req_t* req = state.get_req();
 
+    bool start_of_res = (req->res.status == 0);
+
+    if(start_of_res) {
+        h2o_add_header(&req->pool, &req->res.headers, H2O_TOKEN_CONTENT_TYPE, NULL,
+                       state.res_content_type.data(), state.res_content_type.size());
+        req->res.status = (state.status == 0 && state.send_state != H2O_SEND_STATE_FINAL) ? 200 : state.status;
+        req->res.reason = state.reason;
+    }
+
     if(state.is_req_early_exit) {
         // premature termination of async request: handle this explicitly as otherwise, request is not being closed
         LOG(INFO) << "Premature termination of async request.";
@@ -819,29 +866,25 @@ void HttpServer::stream_response(stream_response_state_t& state) {
             h2o_start_response(req, state.generator);
         }
 
-        if(state.is_req_http1) {
-            h2o_send(req, &state.res_body, 1, H2O_SEND_STATE_FINAL);
-            h2o_dispose_request(req);
-        } else {
-            h2o_send(req, &state.res_body, 1, H2O_SEND_STATE_ERROR);
-        }
+        h2o_send(req, &state.res_buff, 1, H2O_SEND_STATE_FINAL);
+        h2o_dispose_request(req);
 
         return ;
     }
 
-    if (state.is_res_start) {
+    if (start_of_res) {
         /*LOG(INFO) << "h2o_start_response, content_type=" << state.res_content_type
                   << ",response.status_code=" << state.res_status_code;*/
         h2o_start_response(req, state.generator);
     }
 
-    if(state.res_body.len == 0 && state.send_state != H2O_SEND_STATE_FINAL) {
+    if(state.res_buff.len == 0 && state.send_state != H2O_SEND_STATE_FINAL) {
         // without this guard, http streaming will break
         state.generator->proceed(state.generator, req);
         return;
     }
 
-    h2o_send(req, &state.res_body, 1, state.send_state);
+    h2o_send(req, &state.res_buff, 1, state.send_state);
 
     //LOG(INFO) << "stream_response after send";
 }
@@ -969,7 +1012,7 @@ bool HttpServer::on_stream_response_message(void *data) {
     // NOTE: access to `req` and `res` objects must be synchronized and wrapped by `req_res`
 
     if(req_res->is_alive()) {
-        stream_response(req_res->res_state);
+        stream_response(req_res->get_res_state());
     } else {
         // serialized request or generator has been disposed (underlying request is probably dead)
         req_res->req_notify();
@@ -995,7 +1038,7 @@ bool HttpServer::on_request_proceed_message(void *data) {
         req_res->req->chunk_len = 0;
 
         if(req_res->req->_req && req_res->req->_req->proceed_req) {
-            req_res->req->_req->proceed_req(req_res->req->_req, written, stream_state);
+            req_res->req->_req->proceed_req(req_res->req->_req, NULL);
         }
     }
 
@@ -1026,6 +1069,10 @@ void HttpServer::do_snapshot(const std::string& snapshot_path, const std::shared
 
 bool HttpServer::trigger_vote() {
     return replication_state->trigger_vote();
+}
+
+bool HttpServer::reset_peers() {
+    return replication_state->reset_peers();
 }
 
 ThreadPool* HttpServer::get_thread_pool() const {
@@ -1099,4 +1146,8 @@ bool HttpServer::is_leader() const {
 
 ThreadPool* HttpServer::get_meta_thread_pool() const {
     return meta_thread_pool;
+}
+
+void HttpServer::decr_pending_writes() {
+    return replication_state->decr_pending_writes();
 }

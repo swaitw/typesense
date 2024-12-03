@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <string>
 
 template <typename T=uint32_t>
 class Option {
@@ -28,6 +29,18 @@ public:
         is_ok = obj.is_ok;
         error_msg = obj.error_msg;
         error_code = obj.error_code;
+    }
+
+    Option& operator=(Option&& obj) noexcept {
+        if (&obj == this)
+            return *this;
+
+        value = obj.value;
+        is_ok = obj.is_ok;
+        error_msg = obj.error_msg;
+        error_code = obj.error_code;
+
+        return *this;
     }
 
     bool ok() const {

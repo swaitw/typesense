@@ -11,7 +11,8 @@
 #include "string_utils.h"
 #include "logger.h"
 #include "app_metrics.h"
-#include "config.h"
+#include "tsconfig.h"
+#include "zlib.h"
 
 #define H2O_USE_LIBUV 0
 extern "C" {
@@ -205,8 +206,52 @@ public:
     virtual ~req_state_t() = default;
 };
 
+struct stream_response_state_t {
+private:
+
+    h2o_req_t* req = nullptr;
+
+public:
+
+    bool is_req_early_exit = false;
+
+    bool is_res_start = true;
+    h2o_send_state_t send_state = H2O_SEND_STATE_IN_PROGRESS;
+
+    std::string res_body;
+    h2o_iovec_t res_buff;
+
+    std::string res_content_type;
+    int status = 0;
+    const char* reason = nullptr;
+
+    h2o_generator_t* generator = nullptr;
+
+    void set_response(uint32_t status_code, const std::string& content_type, std::string& body) {
+        std::string().swap(res_body);
+        res_body = std::move(body);
+        res_buff = h2o_iovec_t{.base = res_body.data(), .len = res_body.size()};
+
+        if(is_res_start) {
+            res_content_type = std::move(content_type);
+            status = (int)status_code;
+            reason = http_res::get_status_reason(status_code);
+            is_res_start = false;
+        }
+    }
+
+    void set_req(h2o_req_t* _req) {
+        req = _req;
+    }
+
+    h2o_req_t* get_req() {
+        return req;
+    }
+};
+
 struct http_req {
     static constexpr const char* AUTH_HEADER = "x-typesense-api-key";
+    static constexpr const char* USER_HEADER = "x-typesense-user-id";
     static constexpr const char* AGENT_HEADER = "user-agent";
 
     h2o_req_t* _req;
@@ -244,13 +289,18 @@ struct http_req {
 
     int64_t log_index;
 
-    std::atomic<bool> is_http_v1;
     std::atomic<bool> is_diposed;
     std::string client_ip = "0.0.0.0";
 
+    z_stream zs;
+    bool zstream_initialized = false;
+
+    // stores http lib related datastructures to avoid race conditions between indexing and http write threads
+    stream_response_state_t res_state;
+
     http_req(): _req(nullptr), route_hash(1),
                 first_chunk_aggregate(true), last_chunk_aggregate(false),
-                chunk_len(0), body_index(0), data(nullptr), ready(false), log_index(0), is_http_v1(true),
+                chunk_len(0), body_index(0), data(nullptr), ready(false), log_index(0),
                 is_diposed(false) {
 
         start_ts = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -272,7 +322,6 @@ struct http_req {
         if(_req != nullptr) {
             const auto& tv = _req->processed_at.at;
             conn_ts = (tv.tv_sec * 1000 * 1000) + tv.tv_usec;
-            is_http_v1 = (_req->version < 0x200);
         } else {
             conn_ts = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -308,17 +357,16 @@ struct http_req {
                 AppMetrics::get_instance().increment_count(AppMetrics::OVERLOADED_LABEL, 1);
             } else if(log_slow_searches || log_slow_requests) {
                 // log slow request if logging is enabled
-                std::string query_string = "?";
                 bool is_multi_search_query = (path_without_query == "/multi_search");
+                std::string query_string = "?";
 
                 if(is_multi_search_query) {
                     StringUtils::erase_char(body, '\n');
-                } else {
-                    // ignore params map of multi_search since it is mutated for every search object in the POST body
-                    for(const auto& kv: params) {
-                        if(kv.first != AUTH_HEADER) {
-                            query_string += kv.first + "=" + kv.second + "&";
-                        }
+                }
+
+                for(const auto& kv: params) {
+                    if(kv.first != AUTH_HEADER) {
+                        query_string += kv.first + "=" + kv.second + "&";
                     }
                 }
 
@@ -333,6 +381,11 @@ struct http_req {
 
         delete data;
         data = nullptr;
+
+        if(zstream_initialized) {
+            zstream_initialized = false;
+            inflateEnd(&zs);
+        }
     }
 
     void wait() {
@@ -405,7 +458,7 @@ struct http_req {
 struct route_path {
     std::string http_method;
     std::vector<std::string> path_parts;
-    bool (*handler)(const std::shared_ptr<http_req>&, const std::shared_ptr<http_res>&);
+    bool (*handler)(const std::shared_ptr<http_req>&, const std::shared_ptr<http_res>&) = nullptr;
     bool async_req;
     bool async_res;
     std::string action;
@@ -432,63 +485,7 @@ struct route_path {
         return (hash > 100) ? hash : (hash + 100);  // [0-99] reserved for special codes
     }
 
-    std::string _get_action() {
-        // `resource:operation` forms an action
-        // operations: create, get, list, delete, search, import, export
-
-        std::string resource;
-        std::string operation;
-
-        size_t resource_index = 0;
-        size_t identifier_index = 0;
-
-        for(size_t i = 0; i < path_parts.size(); i++) {
-            if(path_parts[i][0] == ':') {
-                identifier_index = i;
-            }
-        }
-
-        if(identifier_index == 0) {
-            // means that no identifier found, so set the last part as resource
-            resource_index = path_parts.size() - 1;
-        } else if(identifier_index == (path_parts.size() - 1)) {
-            // is already last position
-            resource_index = identifier_index - 1;
-        } else {
-            resource_index = identifier_index + 1;
-        }
-
-        resource = path_parts[resource_index];
-
-        // special case to maintain semantics and backward compatibility
-        if(resource == "multi_search") {
-            return "documents:search";
-        }
-
-        if(resource_index != path_parts.size() - 1 && path_parts[resource_index+1][0] != ':') {
-            // e.g. /collections/:collection/documents/search
-            operation = path_parts[resource_index+1];
-        } else {
-            // e.g /collections or /collections/:collection/foo or /collections/:collection
-
-            if(http_method == "GET") {
-                // GET can be a `get` or `list`
-                operation = (resource_index == path_parts.size()-1) ? "list" : "get";
-            } else if(http_method == "POST") {
-                operation = "create";
-            } else if(http_method == "PUT") {
-                operation = "upsert";
-            } else if(http_method == "DELETE") {
-                operation = "delete";
-            } else if(http_method == "PATCH") {
-                operation = "update";
-            } else {
-                operation = "unknown";
-            }
-        }
-
-        return resource + ":" + operation;
-    }
+    std::string _get_action();
 };
 
 struct h2o_custom_res_message_t {
@@ -545,4 +542,11 @@ struct http_message_dispatcher {
     void on(const std::string & message, bool (*handler)(void*)) {
         message_handlers.emplace(message, handler);
     }
+};
+
+struct async_stream_response_t {
+    std::vector<std::string> response_chunks;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool ready = false;
 };

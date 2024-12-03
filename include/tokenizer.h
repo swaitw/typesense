@@ -8,10 +8,11 @@
 #include <unicode/translit.h>
 #include "japanese_localizer.h"
 #include "logger.h"
+#include "stemmer_manager.h"
 
 class Tokenizer {
 private:
-    std::string_view text;
+    std::string text;
     size_t i;
     const bool normalize;
     const bool no_op;
@@ -47,6 +48,8 @@ private:
 
     icu::Transliterator* transliterator = nullptr;
 
+    std::shared_ptr<Stemmer> stemmer = nullptr;
+
     inline size_t get_stream_mode(char c) {
         return (std::isalnum(c) || index_symbols[uint8_t(c)] == 1) ? INDEX : (
             (c == ' ' || c == '\n' || separator_symbols[uint8_t(c)] == 1) ? SEPARATE : SKIP
@@ -59,7 +62,8 @@ public:
                        bool normalize=true, bool no_op=false,
                        const std::string& locale = "",
                        const std::vector<char>& symbols_to_index = {},
-                       const std::vector<char>& separators = {});
+                       const std::vector<char>& separators = {},
+                       std::shared_ptr<Stemmer> stemmer = nullptr);
 
     ~Tokenizer() {
         iconv_close(cd);
@@ -84,5 +88,13 @@ public:
         return (c & ~0x7f) == 0;
     }
 
+    static bool belongs_to_general_punctuation_unicode_block(UChar c);
+
     void decr_token_counter();
+
+    bool should_skip_char(char c);
+
+    static std::string normalize_ascii_no_spaces(const std::string& text);
+
+    static bool has_word_tokenizer(const std::string& locale);
 };

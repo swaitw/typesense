@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <or_iterator.h>
 #include "posting_list.h"
 #include "threadpool.h"
 
@@ -91,7 +92,9 @@ public:
 
     static void merge(const std::vector<void*>& posting_lists, std::vector<uint32_t>& result_ids);
 
-    static void intersect(const std::vector<void*>& posting_lists, std::vector<uint32_t>& result_ids);
+    static void intersect(const std::vector<void*>& posting_lists, std::vector<uint32_t>& result_ids,
+                          const uint32_t& context_ids_length = 0,
+                          const uint32_t* context_ids = nullptr);
 
     static void get_array_token_positions(
         uint32_t id,
@@ -109,6 +112,9 @@ public:
 
     static void get_matching_array_indices(const std::vector<void*>& raw_posting_lists,
                                            uint32_t id, std::vector<size_t>& indices);
+
+    static void get_or_iterator(void*& raw_posting_lists, std::vector<or_iterator_t>& or_iterators,
+                                std::vector<posting_list_t*>& expanded_plists);
 };
 
 template<class T>

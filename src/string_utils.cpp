@@ -7,6 +7,7 @@
 #include <map>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <join.h>
 #include "logger.h"
 
 StringUtils::StringUtils() {
@@ -349,9 +350,39 @@ size_t StringUtils::get_num_chars(const std::string& s) {
     return j;
 }
 
-Option<bool> StringUtils::tokenize_filter_query(const std::string& filter_query, std::queue<std::string>& tokens) {
+Option<bool> parse_multi_valued_geopoint_filter(const std::string& filter_query, std::string& tokens, size_t& index) {
+    // Multi-valued geopoint filter.
+    // field_name:[ ([points], options), ([points]) ]
+    auto error = Option<bool>(400, "Could not parse the geopoint filter.");
+    if (filter_query[index] != '[') {
+        return error;
+    }
+
+    size_t start_index = index;
     auto size = filter_query.size();
-    for (auto i = 0; i < size;) {
+
+    // Individual geopoint filters have square brackets inside them.
+    int square_bracket_count = 1;
+    while (++index < size && square_bracket_count > 0) {
+        if (filter_query[index] == '[') {
+            square_bracket_count++;
+        } else if (filter_query[index] == ']') {
+            square_bracket_count--;
+        }
+    }
+
+    if (square_bracket_count != 0) {
+        return error;
+    }
+
+    tokens = filter_query.substr(start_index, index - start_index);
+    return Option<bool>(true);
+}
+
+Option<bool> StringUtils::tokenize_filter_query(const std::string& filter_query, std::queue<std::string>& tokens) {
+    std::set<std::string> ref_collection_names;
+    auto size = filter_query.size();
+    for (size_t i = 0; i < size;) {
         auto c = filter_query[i];
         if (c == ' ') {
             i++;
@@ -377,6 +408,15 @@ Option<bool> StringUtils::tokenize_filter_query(const std::string& filter_query,
             tokens.push("||");
             i += 2;
         } else {
+            // Reference filter would start with $ symbol.
+            if (c == '$') {
+                auto op = Join::parse_reference_filter(filter_query, tokens, i, ref_collection_names);
+                if (!op.ok()) {
+                    return op;
+                }
+                continue;
+            }
+
             std::stringstream ss;
             bool inBacktick = false;
             bool preceding_colon = false;
@@ -399,6 +439,15 @@ Option<bool> StringUtils::tokenize_filter_query(const std::string& filter_query,
                 if (preceding_colon && c == '(') {
                     is_geo_value = true;
                     preceding_colon = false;
+                } else if (preceding_colon && c == '[') {
+                    std::string value;
+                    auto op = parse_multi_valued_geopoint_filter(filter_query, value, i);
+                    if (!op.ok()) {
+                        return op;
+                    }
+
+                    ss << value;
+                    break;
                 } else if (preceding_colon && c != ' ') {
                     preceding_colon = false;
                 }
@@ -413,7 +462,98 @@ Option<bool> StringUtils::tokenize_filter_query(const std::string& filter_query,
     return Option<bool>(true);
 }
 
+Option<bool> StringUtils::split_include_exclude_fields(const std::string& include_exclude_fields,
+                                                       std::vector<std::string>& tokens) {
+    std::string token;
+    auto const& size = include_exclude_fields.size();
+    for (size_t i = 0; i < size;) {
+        auto c = include_exclude_fields[i];
+        if (c == ' ') {
+            i++;
+            continue;
+        } else if (c == '$') { // Reference include/exclude
+            std::string ref_include_token;
+            auto split_op = Join::split_reference_include_exclude_fields(include_exclude_fields, i, ref_include_token);
+            if (!split_op.ok()) {
+                return split_op;
+            }
+
+            tokens.push_back(ref_include_token);
+            continue;
+        }
+
+        auto comma_pos = include_exclude_fields.find(',', i);
+        token = include_exclude_fields.substr(i, (comma_pos == std::string::npos ? size : comma_pos) - i);
+        trim(token);
+        if (!token.empty()) {
+            tokens.push_back(token);
+        }
+
+        if (comma_pos == std::string::npos) {
+            break;
+        }
+        i = comma_pos + 1;
+        token.clear();
+    }
+
+    return Option<bool>(true);
+}
+
+size_t StringUtils::split_facet(const std::string &s, std::vector<std::string> &result, const bool keep_empty,
+                                const size_t start_index, const size_t max_values) {
+
+
+    std::string::const_iterator substart = s.begin()+start_index, subend;
+    size_t end_index = start_index;
+    std::string delim(""), temp("");
+    std::string current_str=s;
+    while (true) {
+        auto range_pos = current_str.find("(");
+        auto normal_pos = current_str.find(",");
+
+        if(range_pos == std::string::npos && normal_pos == std::string::npos){
+            if(!current_str.empty()){
+                result.push_back(trim(current_str));
+            }
+            break;
+        }
+        else if(range_pos < normal_pos){
+            delim="),";
+            subend = std::search(substart, s.end(), delim.begin(), delim.end());
+            temp = std::string(substart, subend) + (*subend == ')' ? ")" : "");
+        }
+        else{
+            delim=",";
+            subend = std::search(substart, s.end(), delim.begin(), delim.end());
+            temp = std::string(substart, subend);
+        }
+
+        end_index += temp.size() + delim.size();
+        temp = trim(temp);
+
+        if (keep_empty || !temp.empty()) {
+            result.push_back(temp);
+        }
+
+        if(result.size() == max_values) {
+            break;
+        }
+
+        if (subend == s.end()) {
+            break;
+        }
+        substart = subend + delim.size();
+        current_str = std::string(substart, s.end());
+    }
+
+    return std::min(end_index, s.size());
+}
+
 /*size_t StringUtils::unicode_length(const std::string& bytes) {
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> utf8conv;
     return utf8conv.from_bytes(bytes).size();
 }*/
+
+size_t StringUtils::get_occurence_count(const std::string &str, char symbol) {
+    return std::count(str.begin(), str.end(), symbol);
+}

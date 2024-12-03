@@ -13,13 +13,21 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <ifaddrs.h>
+#include "analytics_manager.h"
+#include "housekeeper.h"
 
 #include "core_api.h"
 #include "ratelimit_manager.h"
+#include "embedder_manager.h"
 #include "typesense_server_utils.h"
-#include "file_utils.h"
 #include "threadpool.h"
+#include "stopwords_manager.h"
+#include "conversation_manager.h"
+#include "vq_model_manager.h"
+
+#ifndef ASAN_BUILD
 #include "jemalloc.h"
+#endif
 
 #include "stackprinter.h"
 
@@ -50,24 +58,17 @@ void catch_interrupt(int sig) {
     quit_raft_service = true;
 }
 
-Option<std::string> fetch_file_contents(const std::string & file_path) {
-    if(!file_exists(file_path)) {
-        return Option<std::string>(404, std::string("File does not exist at: ") + file_path);
-    }
-
-    std::ifstream infile(file_path);
-    std::string content((std::istreambuf_iterator<char>(infile)), (std::istreambuf_iterator<char>()));
-    infile.close();
-
-    return Option<std::string>(content);
-}
-
 void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.set_program_name("./typesense-server");
 
     options.add<std::string>("data-dir", 'd', "Directory where data will be stored.", true);
     options.add<std::string>("api-key", 'a', "API key that allows all operations.", true);
     options.add<std::string>("search-only-api-key", 's', "[DEPRECATED: use API key management end-point] API key that allows only searches.", false);
+    options.add<std::string>("health-rusage-api-key", '\0', "API key that allows access to health end-point with resource usage.", false);
+    options.add<std::string>("analytics-dir", '\0', "Directory where Analytics will be stored.", false);
+    options.add<uint32_t>("analytics-db-ttl", '\0', "TTL in seconds for events stored in analytics db", false);
+    options.add<uint32_t>("analytics-minute-rate-limit", '\0', "per minute rate limit for /events endpoint", false);
+
 
     options.add<std::string>("api-address", '\0', "Address to which Typesense API service binds.", false, "0.0.0.0");
     options.add<uint32_t>("api-port", '\0', "Port on which Typesense API service listens.", false, 8108);
@@ -101,11 +102,22 @@ void init_cmdline_options(cmdline::parser & options, int argc, char **argv) {
     options.add<std::string>("config", '\0', "Path to the configuration file.", false, "");
 
     options.add<bool>("enable-access-logging", '\0', "Enable access logging.", false, false);
+    options.add<bool>("enable-search-logging", '\0', "Enable search logging.", false, false);
+    options.add<bool>("enable-search-analytics", '\0', "Enable search analytics.", false, false);
     options.add<int>("disk-used-max-percentage", '\0', "Reject writes when used disk space exceeds this percentage. Default: 100 (never reject).", false, 100);
     options.add<int>("memory-used-max-percentage", '\0', "Reject writes when memory usage exceeds this percentage. Default: 100 (never reject).", false, 100);
     options.add<bool>("skip-writes", '\0', "Skip all writes except config changes. Default: false.", false, false);
+    options.add<bool>("reset-peers-on-error", '\0', "Reset node's peers on clustering error. Default: false.", false, false);
 
     options.add<int>("log-slow-searches-time-ms", '\0', "When >= 0, searches that take longer than this duration are logged.", false, 30*1000);
+    options.add<int>("cache-num-entries", '\0', "Number of entries to cache.", false, 1000);
+    options.add<uint32_t>("analytics-flush-interval", '\0', "Frequency of persisting analytics data to disk (in seconds).", false, 3600);
+    options.add<uint32_t>("housekeeping-interval", '\0', "Frequency of housekeeping background job (in seconds).", false, 1800);
+    options.add<bool>("enable-lazy-filter", '\0', "Filter clause will be evaluated lazily.", false, false);
+    options.add<uint32_t>("db-compaction-interval", '\0', "Frequency of RocksDB compaction (in seconds).", false, 604800);
+    options.add<uint16_t>("filter-by-max-ops", '\0', "Maximum number of operations permitted in filtery_by.", false, Config::FILTER_BY_DEFAULT_OPERATIONS);
+
+    options.add<int>("max-per-page", '\0', "Max number of hits per page", false, 250);
 
     // DEPRECATED
     options.add<std::string>("listen-address", 'h', "[DEPRECATED: use `api-address`] Address to which Typesense API service binds.", false, "0.0.0.0");
@@ -151,27 +163,6 @@ int init_root_logger(Config & config, const std::string & server_version) {
     }
 
     return 0;
-}
-
-Option<std::string> fetch_nodes_config(const std::string& path_to_nodes) {
-    std::string nodes_config;
-
-    if(!path_to_nodes.empty()) {
-        const Option<std::string> & nodes_op = fetch_file_contents(path_to_nodes);
-
-        if(!nodes_op.ok()) {
-            return Option<std::string>(500, "Error reading file containing nodes configuration: " + nodes_op.error());
-        } else {
-            nodes_config = nodes_op.get();
-            if(nodes_config.empty()) {
-                return Option<std::string>(500, "File containing nodes configuration is empty.");
-            } else {
-                nodes_config = nodes_op.get();
-            }
-        }
-    }
-
-    return Option<std::string>(nodes_config);
 }
 
 bool is_private_ip(uint32_t ip) {
@@ -247,19 +238,21 @@ const char* get_internal_ip(const std::string& subnet_cidr) {
     return "127.0.0.1";
 }
 
-int start_raft_server(ReplicationState& replication_state, const std::string& state_dir, const std::string& path_to_nodes,
+int start_raft_server(ReplicationState& replication_state, Store& store,
+                      const std::string& state_dir, const std::string& path_to_nodes,
                       const std::string& peering_address, uint32_t peering_port, const std::string& peering_subnet,
-                      uint32_t api_port, int snapshot_interval_seconds, int snapshot_max_byte_count_per_rpc) {
+                      uint32_t api_port, int snapshot_interval_seconds, int snapshot_max_byte_count_per_rpc,
+                      const std::atomic<bool>& reset_peers_on_error) {
 
     if(path_to_nodes.empty()) {
         LOG(INFO) << "Since no --nodes argument is provided, starting a single node Typesense cluster.";
     }
 
-    const Option<std::string>& nodes_config_op = fetch_nodes_config(path_to_nodes);
+    const Option<std::string>& nodes_config_op = Config::fetch_nodes_config(path_to_nodes);
 
     if(!nodes_config_op.ok()) {
         LOG(ERROR) << nodes_config_op.error();
-        exit(-1);
+        return -1;
     }
 
     butil::ip_t peering_ip;
@@ -292,9 +285,6 @@ int start_raft_server(ReplicationState& replication_state, const std::string& st
         exit(-1);
     }
 
-    // NOTE: braft uses `election_timeout_ms / 2` as the brpc channel `timeout_ms` configuration,
-    // which in turn is the upper bound for brpc `connect_timeout_ms` value.
-    // Reference: https://github.com/apache/incubator-brpc/blob/122770d/docs/en/client.md#timeout
     size_t election_timeout_ms = 5000;
 
     if (replication_state.start(peering_endpoint, api_port, election_timeout_ms, snapshot_max_byte_count_per_rpc, state_dir,
@@ -312,18 +302,17 @@ int start_raft_server(ReplicationState& replication_state, const std::string& st
     while (!brpc::IsAskedToQuit() && !quit_raft_service.load()) {
         if(raft_counter % 10 == 0) {
             // reset peer configuration periodically to identify change in cluster membership
-            const Option<std::string> & refreshed_nodes_op = fetch_nodes_config(path_to_nodes);
+            const Option<std::string> & refreshed_nodes_op = Config::fetch_nodes_config(path_to_nodes);
             if(!refreshed_nodes_op.ok()) {
                 LOG(WARNING) << "Error while refreshing peer configuration: " << refreshed_nodes_op.error();
-                continue;
-            }
+            } else {
+                const std::string& nodes_config = ReplicationState::to_nodes_config(peering_endpoint, api_port,
+                                                                                    refreshed_nodes_op.get());
+                replication_state.refresh_nodes(nodes_config, raft_counter, reset_peers_on_error);
 
-            const std::string& nodes_config = ReplicationState::to_nodes_config(peering_endpoint, api_port,
-                                                                                refreshed_nodes_op.get());
-            replication_state.refresh_nodes(nodes_config);
-
-            if(raft_counter % 60 == 0) {
-                replication_state.do_snapshot(nodes_config);
+                if(raft_counter % 60 == 0) {
+                    replication_state.do_snapshot(nodes_config);
+                }
             }
         }
 
@@ -355,7 +344,7 @@ int start_raft_server(ReplicationState& replication_state, const std::string& st
 
 int run_server(const Config & config, const std::string & version, void (*master_server_routes)()) {
     LOG(INFO) << "Starting Typesense " << version << std::flush;
-
+#ifndef ASAN_BUILD
     if(using_jemalloc()) {
         LOG(INFO) << "Typesense is using jemalloc.";
 
@@ -371,6 +360,7 @@ int run_server(const Config & config, const std::string & version, void (*master
     } else {
         LOG(WARNING) << "Typesense is NOT using jemalloc.";
     }
+#endif
 
     quit_raft_service = false;
 
@@ -378,6 +368,15 @@ int run_server(const Config & config, const std::string & version, void (*master
         LOG(ERROR) << "Typesense failed to start. " << "Data directory " << config.get_data_dir()
                  << " does not exist.";
         return 1;
+    }
+
+    if (config.get_enable_search_analytics() && !config.get_analytics_dir().empty() &&
+        !directory_exists(config.get_analytics_dir())) {
+        LOG(INFO) << "Analytics directory " << config.get_analytics_dir() << " does not exist, will create it...";
+        if(!create_directory(config.get_analytics_dir())) {
+            LOG(ERROR) << "Could not create analytics directory. Quitting.";
+            return 1;
+        }
     }
 
     if(!config.get_master().empty()) {
@@ -396,6 +395,9 @@ int run_server(const Config & config, const std::string & version, void (*master
     std::string db_dir = config.get_data_dir() + "/db";
     std::string state_dir = config.get_data_dir() + "/state";
     std::string meta_dir = config.get_data_dir() + "/meta";
+    std::string analytics_dir = config.get_analytics_dir();
+    int32_t analytics_db_ttl = config.get_analytics_db_ttl();
+    uint32_t analytics_minute_rate_limit = config.get_analytics_minute_rate_limit();
 
     size_t thread_pool_size = config.get_thread_pool_size();
 
@@ -412,10 +414,17 @@ int run_server(const Config & config, const std::string & version, void (*master
     ThreadPool replication_thread_pool(num_threads);
 
     // primary DB used for storing the documents: we will not use WAL since Raft provides that
-    Store store(db_dir);
+    Store store(db_dir, 24*60*60, 1024, true);
 
     // meta DB for storing house keeping things
     Store meta_store(meta_dir, 24*60*60, 1024, false);
+
+    Store* analytics_store = nullptr;
+    if(!analytics_dir.empty()) {
+        //analytics DB for storing analytics events
+        analytics_store = new Store(analytics_dir, 24*60*60, 1024, true, analytics_db_ttl);
+        AnalyticsManager::get_instance().init(&store, analytics_store, analytics_minute_rate_limit);
+    }
 
     curl_global_init(CURL_GLOBAL_SSL);
     HttpClient & httpClient = HttpClient::get_instance();
@@ -446,45 +455,89 @@ int run_server(const Config & config, const std::string & version, void (*master
 
     CollectionManager & collectionManager = CollectionManager::get_instance();
     collectionManager.init(&store, &app_thread_pool, config.get_max_memory_ratio(),
-                           config.get_api_key(), quit_raft_service, batch_indexer);
-    
+                           config.get_api_key(), quit_raft_service, config.get_filter_by_max_ops());
+
+    StopwordsManager& stopwordsManager = StopwordsManager::get_instance();
+    stopwordsManager.init(&store);
+
     RateLimitManager *rateLimitManager = RateLimitManager::getInstance();
-    auto rate_limit_manager_init = rateLimitManager->init(&store);
+    auto rate_limit_manager_init = rateLimitManager->init(&meta_store);
 
     if(!rate_limit_manager_init.ok()) {
         LOG(INFO) << "Failed to initialize rate limit manager: " << rate_limit_manager_init.error();
     }
 
+    EmbedderManager::set_model_dir(config.get_data_dir() + "/models");
+
     // first we start the peering service
 
-    ReplicationState replication_state(server, batch_indexer, &store,
+    ReplicationState replication_state(server, batch_indexer, &store, analytics_store,
                                        &replication_thread_pool, server->get_message_dispatcher(),
                                        ssl_enabled,
                                        &config,
                                        num_collections_parallel_load,
                                        config.get_num_documents_parallel_load());
 
-    std::thread raft_thread([&replication_state, &config, &state_dir,
+    auto conversations_init = ConversationManager::get_instance().init(&replication_state);
+
+    if(!conversations_init.ok()) {
+        LOG(INFO) << "Failed to initialize conversation manager: " << conversations_init.error();
+    }
+
+    std::thread raft_thread([&replication_state, &store, &config, &state_dir,
                              &app_thread_pool, &server_thread_pool, &replication_thread_pool, batch_indexer]() {
 
         std::thread batch_indexing_thread([batch_indexer]() {
             batch_indexer->run();
         });
 
+        std::thread event_sink_thread([&replication_state]() {
+            AnalyticsManager::get_instance().run(&replication_state);
+        });
+
+        std::thread conversation_garbage_collector_thread([]() {
+            LOG(INFO) << "Conversation garbage collector thread started.";
+            ConversationManager::get_instance().run();
+        });
+          
+        HouseKeeper::get_instance().init(config.get_housekeeping_interval());
+        std::thread housekeeping_thread([]() {
+            HouseKeeper::get_instance().run();
+        });
+
+        RemoteEmbedder::init(&replication_state);
+
         std::string path_to_nodes = config.get_nodes();
-        start_raft_server(replication_state, state_dir, path_to_nodes,
+        start_raft_server(replication_state, store, state_dir, path_to_nodes,
                           config.get_peering_address(),
                           config.get_peering_port(),
                           config.get_peering_subnet(),
                           config.get_api_port(),
                           config.get_snapshot_interval_seconds(),
-                          config.get_snapshot_max_byte_count_per_rpc());
+                          config.get_snapshot_max_byte_count_per_rpc(),
+                          config.get_reset_peers_on_error());
 
         LOG(INFO) << "Shutting down batch indexer...";
         batch_indexer->stop();
 
         LOG(INFO) << "Waiting for batch indexing thread to be done...";
         batch_indexing_thread.join();
+
+        LOG(INFO) << "Shutting down event sink thread...";
+        AnalyticsManager::get_instance().stop();
+
+        LOG(INFO) << "Waiting for event sink thread to be done...";
+        event_sink_thread.join();
+
+        LOG(INFO) << "Shutting down conversation garbage collector thread...";
+        ConversationManager::get_instance().stop();
+
+        LOG(INFO) << "Waiting for conversation garbage collector thread to be done...";
+        conversation_garbage_collector_thread.join();
+
+        LOG(INFO) << "Waiting for housekeeping thread to be done...";
+        HouseKeeper::get_instance().stop();
+        housekeeping_thread.join();
 
         LOG(INFO) << "Shutting down server_thread_pool";
 
@@ -495,7 +548,6 @@ int run_server(const Config & config, const std::string & version, void (*master
         app_thread_pool.shutdown();
 
         LOG(INFO) << "Shutting down replication_thread_pool.";
-
         replication_thread_pool.shutdown();
 
         server->stop();
@@ -526,9 +578,15 @@ int run_server(const Config & config, const std::string & version, void (*master
 
     LOG(INFO) << "CollectionManager dispose, this might take some time...";
 
+    // We have to delete the models here, before CUDA driver is unloaded.
+    VQModelManager::get_instance().delete_all_models();
+
     CollectionManager::get_instance().dispose();
+
+    delete analytics_store;
 
     LOG(INFO) << "Bye.";
 
     return ret_code;
 }
+
